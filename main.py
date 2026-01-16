@@ -2,6 +2,7 @@ import okx.MarketData as MarketData
 import asyncio
 import json
 import time
+import signal
 from datetime import datetime
 from okx.websocket.WsPublicAsync import WsPublicAsync
 
@@ -26,6 +27,7 @@ else:
 
 # 创建一个字典来存储所有产品的涨跌幅
 price_changes = {}
+running = True  # 全局运行标志
 
 def calculate_change_rate(open_price, close_price):
     """计算涨跌幅百分比"""
@@ -43,18 +45,13 @@ def callbackFunc(message):
     try:
         # 如果message是字符串，尝试解析为JSON
         if isinstance(message, str):
+            #将json字符串转化为字典
             data = json.loads(message)
         else:
             data = message
         
-        # 根据消息类型处理
-        if "event" in data:
-            event = data["event"]
-            if event == "subscribe":
-                print(f"订阅成功: {data['arg']['instId']} - {data['arg']['channel']}")
-            elif event == "error":
-                print(f"订阅失败: {data['msg']}")
-        elif "data" in data and "arg" in data:
+        # 处理k线数据
+        if "data" in data and "arg" in data:
             # 处理K线数据
             inst_id = data["arg"]["instId"]
             channel = data["arg"]["channel"]
@@ -87,8 +84,8 @@ def callbackFunc(message):
                     }
                     
                     # 每收到10个K线更新，就打印一次排序结果
-                    if len(price_changes) % 10 == 0:
-                        print(f"\n已收到 {len(price_changes)} 个产品的K线数据")
+                    # if len(price_changes) % 10 == 0:
+                    #     print(f"\n已收到 {len(price_changes)} 个产品的K线数据")
                         
     except json.JSONDecodeError:
         print(f"JSON解析失败，原始消息: {message[:100] if len(str(message)) > 100 else message}")
@@ -191,30 +188,15 @@ def sort_and_display_changes():
     # 获取当前时间
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
-    # 获取最早和最新数据的时间戳
-    if price_changes:
-        timestamps = [data['ts'] for data in price_changes.values() if 'ts' in data]
-        if timestamps:
-            min_ts = min(timestamps)
-            max_ts = max(timestamps)
-            min_time = datetime.fromtimestamp(int(min_ts)/1000).strftime("%Y-%m-%d %H:%M")
-            max_time = datetime.fromtimestamp(int(max_ts)/1000).strftime("%Y-%m-%d %H:%M")
-            time_range = f"{min_time} ~ {max_time}"
-        else:
-            time_range = "未知"
-    else:
-        time_range = "未知"
-    
     print("\n" + "="*100)
     print(f"产品涨跌幅排名 - 更新时间: {current_time}")
-    print(f"数据时间范围: {time_range}")
     print(f"总计: {len(sorted_changes)} 个产品")
     print("="*100)
     
     # 显示涨幅前10名
     print("\n📈 涨幅前10名:")
     print("-"*100)
-    print(f"{'排名':<5} {'产品ID':<25} {'涨跌幅(%)':<15} {'开盘价':<15} {'收盘价':<15} {'状态':<10}")
+    print(f"{'排名':<5} {'产品ID':<25} {'涨跌幅(%)':<15} {'开盘价':<15} {'收盘价':<15} {'状态':<10}") #控制台排版格式化
     print("-"*100)
     
     for i, (inst_id, data) in enumerate(sorted_changes[:10], 1):
@@ -249,11 +231,19 @@ def sort_and_display_changes():
 
 async def periodic_sort_task(interval=60):
     """定期执行排序和显示任务"""
-    while True:
-        await asyncio.sleep(interval)
-        sort_and_display_changes()
+    try:
+        while running:
+            await asyncio.sleep(interval)
+            sort_and_display_changes()
+    except asyncio.CancelledError:
+        print("排序任务已被取消")
+        raise
+    except Exception as e:
+        print(f"排序任务出错: {e}")
 
 async def main():
+    global running
+    
     ws = WsPublicAsync(url="wss://ws.okx.com:8443/ws/v5/business")
     await ws.start()
     
@@ -273,25 +263,54 @@ async def main():
     
     try:
         # 持续运行，直到被中断
-        while True:
+        while running:
             await asyncio.sleep(5)
             # 每5秒检查一次，如果有新数据就显示（可选）
             if len(price_changes) > 0 and len(price_changes) % 20 == 0:
                 print(f"\n⚡ 实时更新: 已收集 {len(price_changes)} 个产品的K线数据")
                 
     except KeyboardInterrupt:
-        print("\n正在取消订阅...")
-        # 取消定期任务
-        sort_task.cancel()
-        # 显示最终排序结果
-        sort_and_display_changes()
-        await ws.unsubscribe(args, callback=callbackFunc)
-        await asyncio.sleep(1)
-        print("程序结束")
+        print("\n检测到中断信号...")
     except Exception as e:
         print(f"WebSocket连接异常: {e}")
+    finally:
+        # 清理工作
+        running = False
+        
+        # 取消排序任务
+        if sort_task and not sort_task.done():
+            sort_task.cancel()
+            try:
+                await sort_task
+            except asyncio.CancelledError:
+                pass
+        
         # 显示最终排序结果
+        print("\n正在停止程序...")
         sort_and_display_changes()
+        
+        # 取消订阅
+        if ws:
+            print("正在取消订阅...")
+            await ws.unsubscribe(args, callback=callbackFunc)
+            await asyncio.sleep(1)
+        
+        print("程序结束")
+
+def signal_handler(signum, frame):
+    """信号处理函数"""
+    global running
+    print(f"\n接收到信号 {signum}, 正在停止程序...")
+    running = False
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # 注册信号处理
+    signal.signal(signal.SIGINT, signal_handler)  # Ctrl+C
+    signal.signal(signal.SIGTERM, signal_handler)  # kill命令
+    
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n程序已被用户中断")
+    except Exception as e:
+        print(f"程序运行出错: {e}")
