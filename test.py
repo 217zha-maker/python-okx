@@ -9,12 +9,12 @@ def callbackFunc(message):
 
 
 async def main():
-    ws = WsPublicAsync(url="wss://wspap.okx.com:8443/ws/v5/business")
+    ws = WsPublicAsync(url="wss://ws.okx.com:8443/ws/v5/business")
     await ws.start()
     args = [
         {
           "channel": "candle1H",
-          "instId": "MEME-USDT-SWAP"
+          "instId": "KGEN-USDT-SWAP"
         }
     ]
 

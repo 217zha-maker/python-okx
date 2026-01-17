@@ -10,6 +10,8 @@ from okx.websocket.WsPublicAsync import WsPublicAsync
 from aiohttp import web
 import aiohttp_cors
 import threading
+import copy
+import gc
 
 # 全局变量
 flag = "0"
@@ -17,6 +19,18 @@ price_changes = {}
 running = True
 clients = set()  # 存储连接的WebSocket客户端
 main_event_loop = None  # 存储主事件循环
+total_products = 0  # 初始获取的产品总数
+inst_ids = []  # 所有产品ID列表
+last_received_time = {}  # 记录每个产品最后收到数据的时间
+
+# 内存优化配置
+MAX_PRODUCTS = 300  # 限制监控的最大产品数量
+MEMORY_CHECK_INTERVAL = 60  # 内存检查间隔（秒）
+DATA_CLEANUP_INTERVAL = 300  # 数据清理间隔（秒）
+
+# 高效数据结构
+update_lock = threading.Lock()
+broadcast_queue = asyncio.Queue(maxsize=100)  # 限制队列大小
 
 def format_inst_id(inst_id):
     """格式化产品ID，去掉-USDT-SWAP后缀"""
@@ -26,202 +40,141 @@ def format_inst_id(inst_id):
         return inst_id.replace('-SWAP', '')
     return inst_id
 
-# HTML 模板（修改了CSS和JavaScript）
-HTML_TEMPLATE = '''
-<!DOCTYPE html>
+# HTML 模板（简化版，减少内存占用）
+HTML_TEMPLATE = '''<!DOCTYPE html>
 <html>
 <head>
-    <title>OKX SWAP 涨跌幅实时监控</title>
+    <title>OKX SWAP 涨跌幅监控</title>
     <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
-        body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
+        :root {
+            --primary: #3498db;
+            --success: #27ae60;
+            --danger: #e74c3c;
+            --warning: #f39c12;
+            --gray: #7f8c8d;
+            --light: #f8f9fa;
+            --dark: #2c3e50;
+        }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 15px; background: #f5f5f5; }
         .container { max-width: 1400px; margin: 0 auto; }
-        .header { background: linear-gradient(135deg, #2c3e50, #3498db); color: white; padding: 20px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-        .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; margin: 20px 0; }
-        .stat-card { background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.08); transition: transform 0.3s; }
-        .stat-card:hover { transform: translateY(-5px); }
-        .stat-title { font-size: 14px; color: #7f8c8d; text-transform: uppercase; }
-        .stat-value { font-size: 28px; font-weight: bold; margin: 10px 0; }
-        .positive { color: #27ae60; }
-        .negative { color: #e74c3c; }
-        .neutral { color: #3498db; }
-        .tables-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin: 20px 0; }
-        .table-container { background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.08); }
-        table { width: 100%; border-collapse: collapse; }
-        /* 修改：将所有单元格内容左对齐 */
-        th, td { padding: 12px 15px; text-align: left; border-bottom: 1px solid #eee; }
-        th { background: #f8f9fa; font-weight: bold; position: sticky; top: 0; }
-        tr:hover { background: #f5f7fa; }
-        .status-bar { background: white; padding: 15px; border-radius: 10px; margin: 20px 0; display: flex; justify-content: space-between; align-items: center; }
-        .status-indicator { display: flex; align-items: center; }
-        .status-dot { width: 12px; height: 12px; border-radius: 50%; margin-right: 8px; }
-        .status-connected { background: #27ae60; }
-        .status-disconnected { background: #e74c3c; }
-        .controls { display: flex; gap: 10px; }
-        button { padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; font-weight: bold; transition: all 0.3s; }
-        .btn-start { background: #27ae60; color: white; }
-        .btn-stop { background: #e74c3c; color: white; }
-        .btn-export { background: #3498db; color: white; }
-        button:hover { opacity: 0.9; transform: scale(1.05); }
-        button:active { transform: scale(0.95); }
-        .timestamp { color: #7f8c8d; font-size: 14px; }
-        .update-indicator { display: inline-block; width: 10px; height: 10px; background: #27ae60; border-radius: 50%; margin-right: 5px; animation: pulse 2s infinite; }
-        @keyframes pulse {
-            0% { opacity: 1; }
-            50% { opacity: 0.5; }
-            100% { opacity: 1; }
-        }
-        .search-box { 
-            margin-bottom: 15px; 
-            margin-left: 10px;  /* 添加左边距，使搜索框向左移动 */
-            flex-grow: 1;  /* 允许搜索框扩展 */
-            max-width: 300px;  /* 限制搜索框最大宽度 */
-        }
-        .search-box input { 
-            width: 100%; 
-            padding: 10px; 
-            border: 1px solid #ddd; 
-            border-radius: 5px; 
-            font-size: 14px; 
-            box-sizing: border-box;  /* 确保padding不增加宽度 */
-        }
-        .connection-stats { display: flex; gap: 20px; font-size: 14px; }
-        .progress-bar { height: 5px; background: #ecf0f1; border-radius: 3px; margin-top: 10px; overflow: hidden; }
-        .progress-fill { height: 100%; background: #27ae60; width: 0%; transition: width 0.5s; }
-        @media (max-width: 1200px) {
-            .stats-grid { grid-template-columns: repeat(2, 1fr); }
-            .tables-grid { grid-template-columns: 1fr; }
-        }
+        .header { background: var(--dark); color: white; padding: 15px; border-radius: 8px; margin-bottom: 15px; }
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; margin: 15px 0; }
+        .stat-card { background: white; padding: 12px; border-radius: 6px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        .stat-value { font-size: 20px; font-weight: bold; margin: 5px 0; }
+        .positive { color: var(--success); }
+        .negative { color: var(--danger); }
+        .tables-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(500px, 1fr)); gap: 15px; margin: 15px 0; }
+        .table-container { background: white; padding: 15px; border-radius: 6px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); overflow: hidden; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid #eee; }
+        th { background: var(--light); font-weight: 600; }
+        tr:hover { background: #f8f9fa; }
+        .status-bar { background: white; padding: 10px; border-radius: 6px; margin: 15px 0; display: flex; flex-wrap: wrap; gap: 10px; justify-content: space-between; }
+        .controls { display: flex; flex-wrap: wrap; gap: 8px; margin: 15px 0; }
+        button { padding: 8px 15px; border: none; border-radius: 4px; cursor: pointer; font-weight: 600; font-size: 13px; }
+        .btn-start { background: var(--success); color: white; }
+        .btn-stop { background: var(--danger); color: white; }
+        .search-box { margin: 10px 0; }
+        .search-box input { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; font-size: 13px; }
+        .memory-info { font-size: 12px; color: var(--gray); margin-top: 5px; }
+        .memory-warning { color: var(--warning); font-weight: bold; }
         @media (max-width: 768px) {
-            .stats-grid { grid-template-columns: 1fr; }
+            .tables-grid { grid-template-columns: 1fr; }
+            .table-container { padding: 10px; }
         }
-        .product-id { 
-            font-weight: bold; 
-            font-family: 'Consolas', 'Monaco', monospace;
-            cursor: pointer;
-        }
-        .product-id:hover {
-            color: #3498db;
-            text-decoration: underline;
-        }
-        /* 数字列样式 */
-        .number-cell {
-            font-family: 'Consolas', 'Monaco', monospace;
-        }
-        .positive-number {
-            color: #27ae60;
-            font-weight: bold;
-        }
-        .negative-number {
-            color: #e74c3c;
-            font-weight: bold;
-        }
-        /* 表格头部样式 */
-        .table-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 15px;
-        }
-        .table-title {
-            margin: 0;
-            flex-shrink: 0;  /* 防止标题被压缩 */
-        }
+        .compact-table { font-size: 12px; }
+        .compact-table th, .compact-table td { padding: 6px 8px; }
+        .loading { text-align: center; padding: 20px; color: var(--gray); }
+        .update-time { font-size: 12px; color: var(--gray); }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>📈 OKX SWAP 涨跌幅实时监控系统</h1>
-            <div class="timestamp">
-                <span class="update-indicator"></span>
-                实时更新中... 最后更新: <span id="last-update">--:--:--</span>
+            <h2 style="margin: 0; font-size: 18px;">📈 OKX SWAP 监控 (内存优化版)</h2>
+            <div class="update-time">
+                最后更新: <span id="last-update">--:--:--</span>
             </div>
         </div>
         
         <div class="status-bar">
-            <div class="status-indicator">
-                <span class="status-dot status-connected" id="status-dot"></span>
+            <div style="display: flex; align-items: center; gap: 10px;">
+                <span id="status-dot" style="width: 10px; height: 10px; border-radius: 50%; background: #27ae60;"></span>
                 <span id="status-text">连接正常</span>
             </div>
-            <div class="connection-stats">
-                <span>产品总数: <span id="total-products">0</span></span>
-                <span>数据延迟: <span id="data-latency">0ms</span></span>
-                <span>客户端连接: <span id="client-count">1</span></span>
+            <div style="display: flex; gap: 15px; font-size: 13px;">
+                <span>产品: <span id="total-count">0</span>/<span id="total-products">0</span></span>
+                <span>内存: <span id="memory-usage">-- MB</span></span>
             </div>
         </div>
         
         <div class="stats-grid">
             <div class="stat-card">
-                <div class="stat-title">总产品数</div>
-                <div class="stat-value neutral" id="total-count">0</div>
-                <div class="progress-bar"><div class="progress-fill" id="progress-bar"></div></div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-title">平均涨跌幅</div>
+                <div style="font-size: 13px; color: var(--gray);">平均涨跌幅</div>
                 <div class="stat-value" id="avg-change">0.00%</div>
-                <div>上涨/下跌: <span id="up-down-ratio">0/0</span></div>
             </div>
             <div class="stat-card">
-                <div class="stat-title">上涨产品</div>
+                <div style="font-size: 13px; color: var(--gray);">上涨产品</div>
                 <div class="stat-value positive" id="up-count">0</div>
-                <div>占比: <span id="up-percent">0.0%</span></div>
             </div>
             <div class="stat-card">
-                <div class="stat-title">下跌产品</div>
+                <div style="font-size: 13px; color: var(--gray);">下跌产品</div>
                 <div class="stat-value negative" id="down-count">0</div>
-                <div>占比: <span id="down-percent">0.0%</span></div>
+            </div>
+            <div class="stat-card">
+                <div style="font-size: 13px; color: var(--gray);">数据延迟</div>
+                <div class="stat-value" id="data-latency">0ms</div>
             </div>
         </div>
         
         <div class="tables-grid">
             <div class="table-container">
-                <div class="table-header">
-                    <h2 class="table-title">📈 涨幅榜（共<span id="gainers-count">0</span>个）</h2>
-                    <div class="search-box">
-                        <input type="text" id="search-gainers" placeholder="搜索产品...">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                    <h3 style="margin: 0; font-size: 15px;">📈 涨幅榜 (<span id="gainers-count">0</span>)</h3>
+                    <div style="width: 150px;">
+                        <input type="text" id="search-gainers" placeholder="搜索..." style="width: 100%;">
                     </div>
                 </div>
-                <div style="max-height: 600px; overflow-y: auto;">
-                    <table id="gainers-table">
+                <div style="max-height: 400px; overflow-y: auto;">
+                    <table class="compact-table">
                         <thead>
                             <tr>
-                                <th>排名</th>
+                                <th>#</th>
                                 <th>产品</th>
-                                <th>涨跌幅</th>
-                                <th>开盘价</th>
-                                <th>收盘价</th>
+                                <th>涨跌</th>
+                                <th>价格</th>
                                 <th>时间</th>
                             </tr>
                         </thead>
-                        <tbody>
-                            <!-- 实时数据将在这里填充 -->
+                        <tbody id="gainers-body">
+                            <tr><td colspan="5" class="loading">加载中...</td></tr>
                         </tbody>
                     </table>
                 </div>
             </div>
             
             <div class="table-container">
-                <div class="table-header">
-                    <h2 class="table-title">📉 跌幅榜（共<span id="losers-count">0</span>个）</h2>
-                    <div class="search-box">
-                        <input type="text" id="search-losers" placeholder="搜索产品...">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                    <h3 style="margin: 0; font-size: 15px;">📉 跌幅榜 (<span id="losers-count">0</span>)</h3>
+                    <div style="width: 150px;">
+                        <input type="text" id="search-losers" placeholder="搜索..." style="width: 100%;">
                     </div>
                 </div>
-                <div style="max-height: 600px; overflow-y: auto;">
-                    <table id="losers-table">
+                <div style="max-height: 400px; overflow-y: auto;">
+                    <table class="compact-table">
                         <thead>
                             <tr>
-                                <th>排名</th>
+                                <th>#</th>
                                 <th>产品</th>
-                                <th>涨跌幅</th>
-                                <th>开盘价</th>
-                                <th>收盘价</th>
+                                <th>涨跌</th>
+                                <th>价格</th>
                                 <th>时间</th>
                             </tr>
                         </thead>
-                        <tbody>
-                            <!-- 实时数据将在这里填充 -->
+                        <tbody id="losers-body">
+                            <tr><td colspan="5" class="loading">加载中...</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -229,92 +182,89 @@ HTML_TEMPLATE = '''
         </div>
         
         <div class="controls">
-            <button class="btn-start" onclick="sendCommand('start')">开始监控</button>
-            <button class="btn-stop" onclick="sendCommand('stop')">停止监控</button>
-            <button class="btn-export" onclick="sendCommand('export')">导出数据</button>
-            <button onclick="sendCommand('clear')" style="background: #f39c12; color: white;">清空数据</button>
-            <button onclick="location.reload()" style="background: #95a5a6; color: white;">刷新页面</button>
+            <button class="btn-start" onclick="sendCommand('start')">开始</button>
+            <button class="btn-stop" onclick="sendCommand('stop')">停止</button>
+            <button onclick="sendCommand('clear')" style="background: var(--warning); color: white;">清空</button>
+            <button onclick="location.reload()" style="background: var(--gray); color: white;">刷新</button>
+            <button onclick="toggleMemoryMonitor()" style="background: var(--primary); color: white;">内存监控</button>
+            <div style="flex-grow: 1;"></div>
+            <div style="font-size: 12px; color: var(--gray);">
+                <span id="queue-size">队列: 0</span> | 
+                <span id="client-count">连接: 0</span>
+            </div>
         </div>
         
-        <div class="timestamp" style="text-align: center; margin-top: 20px;">
-            系统时间: <span id="system-time">--:--:--</span> | 
-            页面加载时间: <span id="page-load-time">--:--:--</span> | 
-            数据更新时间: <span id="data-update-time">--:--:--</span>
+        <div class="memory-info" id="memory-monitor" style="display: none;">
+            <div>内存使用详情:</div>
+            <div id="memory-details">正在获取...</div>
         </div>
     </div>
     
     <script>
-        let ws;
-        let pageLoadTime = new Date();
-        let lastUpdateTime = new Date();
+        let ws = null;
+        let reconnectTimer = null;
         let updateCount = 0;
-        let currentSearches = { // 存储当前搜索状态
-            gainers: '',
-            losers: ''
-        };
+        let memoryMonitorVisible = false;
         
-        // 初始化WebSocket连接
         function initWebSocket() {
+            if (ws && ws.readyState === WebSocket.OPEN) return;
+            
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             const wsUrl = `${protocol}//${window.location.host}/ws`;
             
             ws = new WebSocket(wsUrl);
             
-            ws.onopen = function() {
+            ws.onopen = () => {
                 console.log('WebSocket连接已建立');
                 updateStatus('connected');
-                // 发送初始请求获取当前数据
                 ws.send(JSON.stringify({type: 'get_data'}));
+                if (reconnectTimer) {
+                    clearTimeout(reconnectTimer);
+                    reconnectTimer = null;
+                }
             };
             
-            ws.onmessage = function(event) {
+            ws.onmessage = (event) => {
                 try {
                     const data = JSON.parse(event.data);
                     updateCount++;
                     
-                    // 根据消息类型处理
                     switch(data.type) {
-                        case 'stats_update':
-                            updateStats(data.data);
-                            break;
-                        case 'table_update':
-                            updateTables(data.data);
-                            break;
                         case 'full_update':
                             updateStats(data.stats);
                             updateTables(data.tables);
                             break;
-                        case 'status':
-                            showNotification(data.message, data.status);
+                        case 'memory_stats':
+                            updateMemoryStats(data);
+                            break;
+                        case 'queue_stats':
+                            document.getElementById('queue-size').textContent = `队列: ${data.size}`;
                             break;
                         case 'command_response':
                             showNotification(data.message, data.success ? 'success' : 'error');
                             break;
                     }
                     
-                    // 更新最后更新时间
-                    lastUpdateTime = new Date();
-                    document.getElementById('last-update').textContent = formatTime(lastUpdateTime);
-                    
-                    // 计算数据延迟
+                    document.getElementById('last-update').textContent = formatTime(new Date());
                     if (data.timestamp) {
                         const latency = new Date() - new Date(data.timestamp);
                         document.getElementById('data-latency').textContent = Math.round(latency) + 'ms';
                     }
                     
                 } catch (error) {
-                    console.error('处理WebSocket消息时出错:', error);
+                    console.error('处理消息时出错:', error);
                 }
             };
             
-            ws.onclose = function() {
+            ws.onclose = () => {
                 console.log('WebSocket连接已关闭');
                 updateStatus('disconnected');
-                // 3秒后尝试重新连接
-                setTimeout(initWebSocket, 3000);
+                if (!reconnectTimer) {
+                    reconnectTimer = setTimeout(initWebSocket, 3000);
+                }
             };
             
-            ws.onerror = function(error) {
+            ws.onerror = (error) => {
                 console.error('WebSocket错误:', error);
                 updateStatus('error');
             };
@@ -324,190 +274,96 @@ HTML_TEMPLATE = '''
             const dot = document.getElementById('status-dot');
             const text = document.getElementById('status-text');
             
-            switch(status) {
-                case 'connected':
-                    dot.className = 'status-dot status-connected';
-                    text.textContent = '连接正常';
-                    break;
-                case 'disconnected':
-                    dot.className = 'status-dot status-disconnected';
-                    text.textContent = '连接断开';
-                    break;
-                case 'error':
-                    dot.className = 'status-dot status-disconnected';
-                    text.textContent = '连接错误';
-                    break;
-            }
+            const colors = {
+                connected: '#27ae60',
+                disconnected: '#e74c3c',
+                error: '#e74c3c'
+            };
+            
+            const texts = {
+                connected: '连接正常',
+                disconnected: '连接断开',
+                error: '连接错误'
+            };
+            
+            dot.style.background = colors[status] || '#e74c3c';
+            text.textContent = texts[status] || '未知状态';
         }
         
         function updateStats(stats) {
-            // 更新统计信息
-            document.getElementById('total-count').textContent = stats.total;
-            // 修改：平均涨跌幅显示小数点后两位
-            document.getElementById('avg-change').textContent = stats.avg_change.toFixed(2) + '%';
-            document.getElementById('avg-change').className = 'stat-value ' + (stats.avg_change >= 0 ? 'positive' : 'negative');
-            document.getElementById('up-count').textContent = stats.up_count;
-            document.getElementById('down-count').textContent = stats.down_count;
-            document.getElementById('up-percent').textContent = stats.up_percent.toFixed(1) + '%';
-            document.getElementById('down-percent').textContent = stats.down_percent.toFixed(1) + '%';
-            document.getElementById('up-down-ratio').textContent = stats.up_count + '/' + stats.down_count;
-            document.getElementById('total-products').textContent = stats.total;
+            document.getElementById('total-count').textContent = stats.collected || 0;
+            document.getElementById('total-products').textContent = stats.total || 0;
             
-            // 更新进度条
-            if (stats.target_total > 0) {
-                const progress = (stats.collected / stats.target_total) * 100;
-                document.getElementById('progress-bar').style.width = progress + '%';
-            }
+            const avgChangeElement = document.getElementById('avg-change');
+            const avgChange = stats.avg_change || 0;
+            avgChangeElement.textContent = avgChange.toFixed(2) + '%';
+            avgChangeElement.className = 'stat-value ' + (avgChange >= 0 ? 'positive' : 'negative');
+            
+            document.getElementById('up-count').textContent = stats.up_count || 0;
+            document.getElementById('down-count').textContent = stats.down_count || 0;
         }
         
         function updateTables(tables) {
-            // 保存当前搜索状态
-            saveSearchStates();
+            updateTable('gainers', tables.gainers || []);
+            updateTable('losers', tables.losers || []);
             
-            // 更新涨幅榜
-            updateTable('gainers', tables.gainers);
-            
-            // 更新跌幅榜
-            updateTable('losers', tables.losers);
-            
-            // 更新数量显示
-            document.getElementById('gainers-count').textContent = tables.gainers.length;
-            document.getElementById('losers-count').textContent = tables.losers.length;
-            
-            // 恢复搜索状态
-            restoreSearchStates();
+            document.getElementById('gainers-count').textContent = (tables.gainers || []).length;
+            document.getElementById('losers-count').textContent = (tables.losers || []).length;
         }
         
-        function saveSearchStates() {
-            // 保存当前搜索框的值
-            currentSearches.gainers = document.getElementById('search-gainers').value || '';
-            currentSearches.losers = document.getElementById('search-losers').value || '';
-        }
-        
-        function restoreSearchStates() {
-            // 恢复搜索状态
-            document.getElementById('search-gainers').value = currentSearches.gainers;
-            document.getElementById('search-losers').value = currentSearches.losers;
+        function updateTable(type, data) {
+            const tbody = document.getElementById(`${type}-body`);
+            if (!tbody) return;
             
-            // 应用过滤
-            if (currentSearches.gainers) {
-                filterTable('gainers', currentSearches.gainers);
+            tbody.innerHTML = '';
+            
+            if (data.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5" class="loading">暂无数据</td></tr>';
+                return;
             }
-            if (currentSearches.losers) {
-                filterTable('losers', currentSearches.losers);
-            }
-        }
-        
-        function updateTable(tableId, data) {
-            const tableBody = document.querySelector(`#${tableId}-table tbody`);
-            tableBody.innerHTML = '';
             
             data.forEach((item, index) => {
                 const row = document.createElement('tr');
-                
-                // 存储完整ID用于提示
-                const fullId = item.inst_id;
-                const displayId = item.display_id || item.inst_id;
-                const isPositive = item.change_rate >= 0;
+                const isPositive = (item.change_rate || 0) >= 0;
                 
                 row.innerHTML = `
                     <td>${index + 1}</td>
-                    <td>
-                        <span class="product-id" title="${fullId}">${displayId}</span>
+                    <td title="${item.inst_id || ''}">${item.display_id || item.inst_id || ''}</td>
+                    <td style="color: ${isPositive ? '#27ae60' : '#e74c3c'}; font-weight: bold;">
+                        ${isPositive ? '+' : ''}${(item.change_rate || 0).toFixed(2)}%
                     </td>
-                    <td class="${isPositive ? 'positive-number' : 'negative-number'} number-cell">
-                        ${isPositive ? '+' : ''}${item.change_rate.toFixed(2)}%  <!-- 修改：小数点后两位 -->
-                    </td>
-                    <td class="number-cell">${formatNumber(item.open_price)}</td>
-                    <td class="number-cell">${formatNumber(item.close_price)}</td>
-                    <td>${item.timestamp}</td>
+                    <td>${formatNumber(item.close_price || 0)}</td>
+                    <td>${item.timestamp || '--:--:--'}</td>
                 `;
                 
-                // 添加点击效果
-                row.addEventListener('click', () => {
-                    row.style.backgroundColor = '#f0f7ff';
-                    setTimeout(() => {
-                        row.style.backgroundColor = '';
-                    }, 500);
-                });
-                
-                tableBody.appendChild(row);
+                tbody.appendChild(row);
             });
         }
         
-        function filterTable(tableId, searchText) {
-            const rows = document.querySelectorAll(`#${tableId}-table tbody tr`);
-            searchText = searchText.toLowerCase();
+        function updateMemoryStats(data) {
+            const usage = data.memory_usage || 0;
+            const usageElement = document.getElementById('memory-usage');
+            usageElement.textContent = `${usage.toFixed(1)} MB`;
             
-            let visibleCount = 0;
-            
-            rows.forEach(row => {
-                const cells = row.getElementsByTagName('td');
-                let match = false;
-                
-                for (let cell of cells) {
-                    if (cell.textContent.toLowerCase().includes(searchText)) {
-                        match = true;
-                        break;
-                    }
-                }
-                
-                if (match) {
-                    row.style.display = '';
-                    visibleCount++;
-                } else {
-                    row.style.display = 'none';
-                }
-            });
-            
-            // 更新显示的数量
-            document.getElementById(`${tableId}-count`).textContent = visibleCount;
-        }
-        
-        function sendCommand(command) {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({type: 'command', command: command}));
+            if (usage > 100) {
+                usageElement.className = 'memory-warning';
             } else {
-                showNotification('WebSocket连接未建立', 'error');
+                usageElement.className = '';
             }
-        }
-        
-        function showNotification(message, type) {
-            // 创建一个简单的通知
-            const notification = document.createElement('div');
-            notification.textContent = message;
-            notification.style.cssText = `
-                position: fixed;
-                top: 20px;
-                right: 20px;
-                padding: 15px 20px;
-                background: ${type === 'success' ? '#27ae60' : type === 'error' ? '#e74c3c' : '#3498db'};
-                color: white;
-                border-radius: 5px;
-                box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-                z-index: 1000;
-                animation: slideIn 0.3s ease-out;
+            
+            const details = document.getElementById('memory-details');
+            details.innerHTML = `
+                进程内存: ${data.process_memory || 0} MB<br>
+                已收集数据: ${data.collected_data || 0} 条<br>
+                订阅产品: ${data.subscribed || 0} 个<br>
+                客户端连接: ${data.clients || 0} 个
             `;
-            
-            document.body.appendChild(notification);
-            
-            // 3秒后自动移除
-            setTimeout(() => {
-                notification.style.animation = 'slideOut 0.3s ease-out';
-                setTimeout(() => {
-                    document.body.removeChild(notification);
-                }, 300);
-            }, 3000);
         }
         
         function formatNumber(num) {
-            if (num >= 1000) {
-                return num.toFixed(2);
-            } else if (num >= 1) {
-                return num.toFixed(4);
-            } else {
-                return num.toFixed(8);
-            }
+            if (num >= 1000) return num.toFixed(2);
+            if (num >= 1) return num.toFixed(4);
+            return num.toFixed(6);
         }
         
         function formatTime(date) {
@@ -519,61 +375,82 @@ HTML_TEMPLATE = '''
             });
         }
         
-        // 更新时间显示
-        function updateTimeDisplay() {
-            document.getElementById('system-time').textContent = formatTime(new Date());
-            document.getElementById('page-load-time').textContent = formatTime(pageLoadTime);
-            document.getElementById('data-update-time').textContent = formatTime(lastUpdateTime);
+        function sendCommand(command) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({type: 'command', command: command}));
+            } else {
+                showNotification('连接未建立', 'error');
+            }
+        }
+        
+        function showNotification(message, type) {
+            // 简单的控制台日志
+            console.log(`${type.toUpperCase()}: ${message}`);
+        }
+        
+        function toggleMemoryMonitor() {
+            const monitor = document.getElementById('memory-monitor');
+            memoryMonitorVisible = !memoryMonitorVisible;
+            monitor.style.display = memoryMonitorVisible ? 'block' : 'none';
             
-            // 更新客户端计数（模拟）
-            document.getElementById('client-count').textContent = Math.max(1, Math.floor(updateCount / 10));
+            if (memoryMonitorVisible && ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({type: 'get_memory_stats'}));
+            }
+        }
+        
+        function initSearch() {
+            ['gainers', 'losers'].forEach(type => {
+                const input = document.getElementById(`search-${type}`);
+                if (input) {
+                    input.addEventListener('input', (e) => {
+                        const searchText = e.target.value.toLowerCase();
+                        const rows = document.querySelectorAll(`#${type}-body tr`);
+                        
+                        rows.forEach(row => {
+                            const cells = row.getElementsByTagName('td');
+                            let match = false;
+                            
+                            for (let cell of cells) {
+                                if (cell.textContent.toLowerCase().includes(searchText)) {
+                                    match = true;
+                                    break;
+                                }
+                            }
+                            
+                            row.style.display = match ? '' : 'none';
+                        });
+                    });
+                }
+            });
         }
         
         // 页面加载完成后初始化
-        document.addEventListener('DOMContentLoaded', function() {
+        document.addEventListener('DOMContentLoaded', () => {
             initWebSocket();
+            initSearch();
             
-            // 每秒钟更新时间显示
-            setInterval(updateTimeDisplay, 1000);
-            
-            // 添加CSS动画
-            const style = document.createElement('style');
-            style.textContent = `
-                @keyframes slideIn {
-                    from { transform: translateX(100%); opacity: 0; }
-                    to { transform: translateX(0); opacity: 1; }
+            // 每秒更新一次时间
+            setInterval(() => {
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    // 定期请求内存统计
+                    if (memoryMonitorVisible) {
+                        ws.send(JSON.stringify({type: 'get_memory_stats'}));
+                    }
+                    // 请求队列状态
+                    ws.send(JSON.stringify({type: 'get_queue_stats'}));
                 }
-                @keyframes slideOut {
-                    from { transform: translateX(0); opacity: 1; }
-                    to { transform: translateX(100%); opacity: 0; }
-                }
-            `;
-            document.head.appendChild(style);
-            
-            // 记录页面加载时间
-            pageLoadTime = new Date();
-            document.getElementById('page-load-time').textContent = formatTime(pageLoadTime);
-            
-            // 添加搜索框输入事件监听
-            document.getElementById('search-gainers').addEventListener('input', function(e) {
-                filterTable('gainers', e.target.value);
-            });
-            
-            document.getElementById('search-losers').addEventListener('input', function(e) {
-                filterTable('losers', e.target.value);
-            });
+            }, 1000);
         });
         
-        // 页面关闭前确认
-        window.onbeforeunload = function() {
+        // 页面关闭前关闭WebSocket
+        window.addEventListener('beforeunload', () => {
             if (ws && ws.readyState === WebSocket.OPEN) {
                 ws.close();
             }
-        };
+        });
     </script>
 </body>
-</html>
-'''
+</html>'''
 
 def calculate_change_rate(open_price, close_price):
     """计算涨跌幅百分比"""
@@ -583,44 +460,105 @@ def calculate_change_rate(open_price, close_price):
         if open_val == 0:
             return 0
         change_rate = ((close_val - open_val) / open_val) * 100
-        return round(change_rate, 4)  # 保持4位精度计算，显示时取2位
+        return round(change_rate, 2)  # 只保留2位小数
     except (ValueError, TypeError):
         return 0
 
+class MemoryOptimizedDataStore:
+    """内存优化的数据存储"""
+    
+    def __init__(self, max_items=100):
+        self.data = {}
+        self.max_items = max_items
+        self.lock = threading.Lock()
+    
+    def update(self, key, value):
+        """更新数据，如果超过最大限制，删除最旧的数据"""
+        with self.lock:
+            # 如果数据量超过限制，删除最旧的数据
+            if len(self.data) >= self.max_items and key not in self.data:
+                # 找到最旧的数据（按最后更新时间）
+                if self.data:
+                    oldest_key = min(self.data.keys(), 
+                                   key=lambda k: self.data[k].get('last_update', 0))
+                    del self.data[oldest_key]
+            
+            self.data[key] = {
+                'change_rate': value.get('change_rate', 0),
+                'close_price': value.get('close_price', 0),
+                'open_price': value.get('open_price', 0),
+                'timestamp': time.time(),
+                'last_update': time.time()
+            }
+    
+    def get(self, key):
+        with self.lock:
+            return self.data.get(key)
+    
+    def get_all(self):
+        with self.lock:
+            return dict(self.data)
+    
+    def clear(self):
+        with self.lock:
+            self.data.clear()
+    
+    def count(self):
+        with self.lock:
+            return len(self.data)
+
+# 使用优化的数据存储
+price_store = MemoryOptimizedDataStore(max_items=MAX_PRODUCTS)
+
 async def okx_websocket_handler():
-    """OKX WebSocket处理器"""
-    global main_event_loop
-    main_event_loop = asyncio.get_event_loop()
+    """OKX WebSocket处理器 - 内存优化版本"""
+    global main_event_loop, total_products, inst_ids
     
-    marketDataAPI = MarketData.MarketAPI(flag=flag)
+    print("OKX WebSocket处理器启动...")
     
-    # 获取产品列表
-    result = marketDataAPI.get_tickers(instType="SWAP")
+    # 只获取主流币种，减少订阅数量
+    main_pairs = [
+        "BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP", 
+        "BNB-USDT-SWAP", "XRP-USDT-SWAP", "ADA-USDT-SWAP",
+        "DOGE-USDT-SWAP", "DOT-USDT-SWAP", "AVAX-USDT-SWAP",
+        "MATIC-USDT-SWAP", "LTC-USDT-SWAP", "LINK-USDT-SWAP",
+        "UNI-USDT-SWAP", "ATOM-USDT-SWAP", "FIL-USDT-SWAP",
+        "ETC-USDT-SWAP", "XLM-USDT-SWAP", "ALGO-USDT-SWAP"
+    ]
     
-    if result["code"] == "0":
-        inst_ids = [item["instId"] for item in result["data"]]
-        target_total = len(inst_ids)
-        print(f"获取到 {target_total} 个SWAP产品")
-    else:
-        inst_ids = ["BTC-USDT-SWAP"]
-        target_total = 1
-        print("获取产品列表失败，使用默认值")
+    # 如果需要更多产品，可以从API获取，但限制数量
+    try:
+        marketDataAPI = MarketData.MarketAPI(flag=flag)
+        result = marketDataAPI.get_tickers(instType="SWAP")
+        
+        if result["code"] == "0":
+            all_products = [item["instId"] for item in result["data"]]
+            # 优先选择主流币种，然后补充其他币种
+            inst_ids = []
+            for pair in main_pairs:
+                if pair in all_products:
+                    inst_ids.append(pair)
+            
+            # 补充其他产品，但总数不超过MAX_PRODUCTS
+            remaining_slots = MAX_PRODUCTS - len(inst_ids)
+            for product in all_products:
+                if product not in inst_ids and remaining_slots > 0:
+                    inst_ids.append(product)
+                    remaining_slots -= 1
+        else:
+            inst_ids = main_pairs[:MAX_PRODUCTS]
+    except Exception as e:
+        print(f"获取产品列表失败: {e}")
+        inst_ids = main_pairs[:min(10, MAX_PRODUCTS)]
+    
+    total_products = len(inst_ids)
+    print(f"选择监控 {total_products} 个产品（内存优化）")
     
     # 连接WebSocket
     ws = WsPublicAsync(url="wss://ws.okx.com:8443/ws/v5/business")
     await ws.start()
     
-    # 订阅所有产品
-    args = []
-    for inst_id in inst_ids:
-        args.append({
-            "channel": "candle1H",
-            "instId": inst_id
-        })
-    
-    print(f"开始订阅 {len(args)} 个产品...")
-    
-    # 修改：将callback函数改回普通函数（非异步）
+    # 分批订阅，避免一次性订阅太多
     def callback(message):
         try:
             if isinstance(message, str):
@@ -628,12 +566,16 @@ async def okx_websocket_handler():
             else:
                 data = message
             
+            # 处理订阅成功消息
+            if "event" in data and data["event"] == "subscribe":
+                print(f"订阅成功: {data['arg']}")
+                return
+            
             # 处理K线数据
             if "data" in data and "arg" in data:
                 inst_id = data["arg"]["instId"]
-                channel = data["arg"]["channel"]
-                
                 kline_data = data["data"]
+                
                 if kline_data and len(kline_data) > 0:
                     latest_kline = kline_data[0]
                     
@@ -641,181 +583,288 @@ async def okx_websocket_handler():
                         open_price = latest_kline[1]
                         close_price = latest_kline[4]
                         
-                        # 计算涨跌幅
                         change_rate = calculate_change_rate(open_price, close_price)
                         
-                        # 存储数据
-                        price_changes[inst_id] = {
+                        # 更新数据存储
+                        price_store.update(inst_id, {
                             'change_rate': change_rate,
                             'open_price': float(open_price),
                             'close_price': float(close_price),
-                            'channel': channel,
-                            'timestamp': time.time(),
-                            'ts': latest_kline[0]
-                        }
+                            'timestamp': time.time()
+                        })
                         
-                        # 修改：使用事件循环安全地调用异步函数
-                        # 创建任务但不阻塞
-                        if main_event_loop and main_event_loop.is_running():
-                            main_event_loop.create_task(broadcast_update())
-                        else:
-                            # 如果事件循环不在运行，尝试启动它
-                            asyncio.run_coroutine_threadsafe(broadcast_update(), main_event_loop)
+                        # 更新最后收到数据的时间
+                        last_received_time[inst_id] = time.time()
                         
+                        # 定期打印进度
+                        collected = price_store.count()
+                        if collected > 0 and collected % 10 == 0:
+                            print(f"已收集 {collected}/{total_products} 个产品数据")
+                        
+                        # 触发广播（非阻塞方式）
+                        try:
+                            if main_event_loop and main_event_loop.is_running():
+                                if broadcast_queue.qsize() < 50:  # 避免队列积压
+                                    asyncio.run_coroutine_threadsafe(
+                                        broadcast_queue.put({
+                                            'type': 'data_update',
+                                            'inst_id': inst_id
+                                        }),
+                                        main_event_loop
+                                    )
+                        except:
+                            pass
+        
         except Exception as e:
             print(f"处理消息时出错: {e}")
     
-    await ws.subscribe(args, callback=callback)
+    # 分批订阅
+    batch_size = 20  # 每批订阅数量
+    for i in range(0, len(inst_ids), batch_size):
+        batch = inst_ids[i:i+batch_size]
+        args = [{"channel": "candle1H", "instId": inst_id} for inst_id in batch]
+        
+        print(f"订阅批次 {i//batch_size + 1}，数量: {len(batch)}")
+        await ws.subscribe(args, callback=callback)
+        await asyncio.sleep(1)  # 每批之间等待1秒
+    
+    print("订阅完成，等待初始数据...")
+    
+    # 等待初始数据
+    await asyncio.sleep(5)
+    
+    initial_received = price_store.count()
+    print(f"初始推送后收到 {initial_received}/{total_products} 个产品数据")
+    
+    # 定期清理长时间未更新的数据
+    async def cleanup_old_data():
+        while running:
+            await asyncio.sleep(DATA_CLEANUP_INTERVAL)
+            
+            current_time = time.time()
+            old_keys = []
+            
+            for inst_id, last_time in list(last_received_time.items()):
+                if current_time - last_time > 600:  # 10分钟没有更新
+                    old_keys.append(inst_id)
+            
+            if old_keys:
+                print(f"清理 {len(old_keys)} 个长时间未更新的数据")
+                for key in old_keys:
+                    if key in last_received_time:
+                        del last_received_time[key]
+    
+    # 启动清理任务
+    cleanup_task = asyncio.create_task(cleanup_old_data())
     
     # 保持连接
     try:
         while running:
             await asyncio.sleep(1)
-    except KeyboardInterrupt:
-        print("收到中断信号...")
+    except Exception as e:
+        print(f"OKX WebSocket错误: {e}")
     finally:
-        # 清理
-        await ws.unsubscribe(args, callback=callback)
-        await asyncio.sleep(1)
+        cleanup_task.cancel()
+        await ws.unsubscribe([], callback=callback)
         print("OKX WebSocket连接已关闭")
 
 def get_statistics():
     """获取统计数据"""
-    if not price_changes:
+    try:
+        data = price_store.get_all()
+        collected = len(data)
+        
+        if collected == 0:
+            return {
+                'total': total_products,
+                'collected': 0,
+                'avg_change': 0,
+                'up_count': 0,
+                'down_count': 0
+            }
+        
+        changes = [item['change_rate'] for item in data.values()]
+        avg_change = sum(changes) / collected
+        up_count = len([c for c in changes if c > 0])
+        down_count = len([c for c in changes if c < 0])
+        
+        return {
+            'total': total_products,
+            'collected': collected,
+            'avg_change': avg_change,
+            'up_count': up_count,
+            'down_count': down_count
+        }
+    except:
         return {
             'total': 0,
             'collected': 0,
-            'target_total': 1,
             'avg_change': 0,
             'up_count': 0,
-            'down_count': 0,
-            'up_percent': 0,
-            'down_percent': 0
+            'down_count': 0
         }
-    
-    changes = [data['change_rate'] for data in price_changes.values()]
-    total = len(changes)
-    
-    if total == 0:
-        return {
-            'total': 0,
-            'collected': 0,
-            'target_total': 1,
-            'avg_change': 0,
-            'up_count': 0,
-            'down_count': 0,
-            'up_percent': 0,
-            'down_percent': 0
-        }
-    
-    avg_change = sum(changes) / total
-    up_count = len([c for c in changes if c > 0])
-    down_count = len([c for c in changes if c < 0])
-    
-    # 目标总数（从OKX API获取的总数）
-    target_total = len(price_changes)  # 这个应该来自初始化时获取的总数
-    
-    return {
-        'total': total,
-        'collected': total,
-        'target_total': target_total,
-        'avg_change': avg_change,
-        'up_count': up_count,
-        'down_count': down_count,
-        'up_percent': (up_count / total) * 100 if total > 0 else 0,
-        'down_percent': (down_count / total) * 100 if total > 0 else 0
-    }
 
 def get_table_data():
-    """获取表格数据 - 修改：显示全部数据，取消前20限制，跌幅榜按跌幅从大到小排序"""
-    if not price_changes:
+    """获取表格数据"""
+    try:
+        data = price_store.get_all()
+        
+        if not data:
+            return {'gainers': [], 'losers': []}
+        
+        # 涨幅榜
+        gainers = []
+        for inst_id, item in data.items():
+            if item['change_rate'] > 0:
+                gainers.append({
+                    'inst_id': inst_id,
+                    'display_id': format_inst_id(inst_id),
+                    'change_rate': item['change_rate'],
+                    'close_price': item['close_price'],
+                    'timestamp': datetime.fromtimestamp(item['timestamp']).strftime("%H:%M:%S")
+                })
+        
+        # 跌幅榜
+        losers = []
+        for inst_id, item in data.items():
+            if item['change_rate'] < 0:
+                losers.append({
+                    'inst_id': inst_id,
+                    'display_id': format_inst_id(inst_id),
+                    'change_rate': item['change_rate'],
+                    'close_price': item['close_price'],
+                    'timestamp': datetime.fromtimestamp(item['timestamp']).strftime("%H:%M:%S")
+                })
+        
+        # 排序
+        gainers.sort(key=lambda x: x['change_rate'], reverse=True)
+        losers.sort(key=lambda x: x['change_rate'])
+        
         return {
-            'gainers': [],
-            'losers': []
+            'gainers': gainers[:50],  # 最多显示50个
+            'losers': losers[:50]     # 最多显示50个
         }
-    
-    # 排序数据
-    sorted_data = sorted(
-        price_changes.items(),
-        key=lambda x: x[1]['change_rate'],
-        reverse=True
-    )
-    
-    # 涨幅榜（显示所有上涨产品，取消前20限制，涨幅从大到小排序）
-    gainers = []
-    for i, (inst_id, data) in enumerate(sorted_data):
-        if data['change_rate'] > 0:
-            gainers.append({
-                'inst_id': inst_id,
-                'display_id': format_inst_id(inst_id),  # 添加格式化后的ID
-                'change_rate': data['change_rate'],
-                'open_price': data['open_price'],
-                'close_price': data['close_price'],
-                'timestamp': datetime.fromtimestamp(data['timestamp']).strftime("%H:%M:%S")
-            })
-    
-    # 跌幅榜（显示所有下跌产品，取消前20限制，跌幅从大到小排序）
-    losers = []
-    # 先筛选所有下跌产品
-    negative_data = [(inst_id, data) for inst_id, data in sorted_data if data['change_rate'] < 0]
-    # 修改：对负数按涨跌幅升序排列（因为负数，升序就是跌幅更大的在前面）
-    negative_data.sort(key=lambda x: x[1]['change_rate'])  # 升序排列，负数越小跌幅越大
-    
-    for i, (inst_id, data) in enumerate(negative_data):
-        losers.append({
-            'inst_id': inst_id,
-            'display_id': format_inst_id(inst_id),  # 添加格式化后的ID
-            'change_rate': data['change_rate'],
-            'open_price': data['open_price'],
-            'close_price': data['close_price'],
-            'timestamp': datetime.fromtimestamp(data['timestamp']).strftime("%H:%M:%S")
-        })
-    
-    return {
-        'gainers': gainers,
-        'losers': losers
-    }
+    except:
+        return {'gainers': [], 'losers': []}
 
-async def broadcast_update():
-    """广播更新给所有连接的客户端"""
-    if not clients:
-        return
+def get_memory_stats():
+    """获取内存统计信息"""
+    import psutil
+    import os
     
-    stats = get_statistics()
-    tables = get_table_data()
+    try:
+        process = psutil.Process(os.getpid())
+        memory_info = process.memory_info()
+        
+        # 转换为MB
+        memory_mb = memory_info.rss / 1024 / 1024
+        
+        return {
+            'memory_usage': memory_mb,
+            'process_memory': round(memory_mb, 1),
+            'collected_data': price_store.count(),
+            'subscribed': total_products,
+            'clients': len(clients)
+        }
+    except:
+        # 如果psutil不可用，返回估计值
+        return {
+            'memory_usage': 0,
+            'process_memory': 0,
+            'collected_data': price_store.count(),
+            'subscribed': total_products,
+            'clients': len(clients)
+        }
+
+async def broadcast_worker():
+    """广播工作者 - 内存优化版本"""
+    last_broadcast_time = 0
+    broadcast_interval = 2  # 广播间隔（秒）
     
-    message = json.dumps({
-        'type': 'full_update',
-        'timestamp': datetime.now().isoformat(),
-        'stats': stats,
-        'tables': tables
-    })
-    
-    # 发送给所有客户端
-    for ws in list(clients):
+    while running:
         try:
-            await ws.send_str(message)
-        except:
-            # 如果发送失败，从客户端列表中移除
-            clients.discard(ws)
+            current_time = time.time()
+            
+            # 检查是否有客户端
+            if not clients:
+                await asyncio.sleep(1)
+                continue
+            
+            # 检查广播间隔
+            if current_time - last_broadcast_time < broadcast_interval:
+                # 处理队列中的消息
+                try:
+                    await asyncio.wait_for(broadcast_queue.get(), timeout=0.5)
+                    broadcast_queue.task_done()
+                except asyncio.TimeoutError:
+                    pass
+                
+                await asyncio.sleep(0.1)
+                continue
+            
+            # 准备广播数据
+            stats = get_statistics()
+            tables = get_table_data()
+            
+            broadcast_msg = json.dumps({
+                'type': 'full_update',
+                'timestamp': datetime.now().isoformat(),
+                'stats': stats,
+                'tables': tables
+            })
+            
+            # 发送给所有客户端
+            disconnected_clients = []
+            for ws in list(clients):
+                try:
+                    await ws.send_str(broadcast_msg)
+                except:
+                    disconnected_clients.append(ws)
+            
+            # 清理断开连接的客户端
+            for ws in disconnected_clients:
+                clients.discard(ws)
+            
+            last_broadcast_time = current_time
+            
+            # 触发垃圾回收
+            if price_store.count() % 20 == 0:
+                gc.collect()
+            
+            await asyncio.sleep(0.1)
+            
+        except Exception as e:
+            print(f"广播工作者出错: {e}")
+            await asyncio.sleep(1)
 
 async def websocket_handler(request):
-    """WebSocket处理器"""
+    """WebSocket处理器 - 内存优化版本"""
     ws = web.WebSocketResponse()
     await ws.prepare(request)
     
     # 添加客户端
     clients.add(ws)
-    print(f"新客户端连接，当前客户端数: {len(clients)}")
+    client_count = len(clients)
+    print(f"新客户端连接，当前客户端数: {client_count}")
     
     try:
+        # 立即发送当前数据
+        stats = get_statistics()
+        tables = get_table_data()
+        
+        await ws.send_str(json.dumps({
+            'type': 'full_update',
+            'timestamp': datetime.now().isoformat(),
+            'stats': stats,
+            'tables': tables
+        }))
+        
         async for msg in ws:
             if msg.type == web.WSMsgType.TEXT:
                 try:
                     data = json.loads(msg.data)
                     
                     if data.get('type') == 'get_data':
-                        # 发送当前完整数据
                         stats = get_statistics()
                         tables = get_table_data()
                         
@@ -829,36 +878,29 @@ async def websocket_handler(request):
                     elif data.get('type') == 'command':
                         command = data.get('command')
                         
-                        if command == 'start':
-                            await ws.send_str(json.dumps({
-                                'type': 'command_response',
-                                'success': True,
-                                'message': '开始监控命令已发送'
-                            }))
-                        
-                        elif command == 'stop':
-                            await ws.send_str(json.dumps({
-                                'type': 'command_response',
-                                'success': True,
-                                'message': '停止监控命令已发送'
-                            }))
-                        
-                        elif command == 'export':
-                            # 导出数据逻辑
-                            await ws.send_str(json.dumps({
-                                'type': 'command_response',
-                                'success': True,
-                                'message': '数据导出功能待实现'
-                            }))
-                        
-                        elif command == 'clear':
-                            price_changes.clear()
-                            await broadcast_update()
+                        if command == 'clear':
+                            price_store.clear()
+                            last_received_time.clear()
                             await ws.send_str(json.dumps({
                                 'type': 'command_response',
                                 'success': True,
                                 'message': '数据已清空'
                             }))
+                    
+                    elif data.get('type') == 'get_memory_stats':
+                        memory_stats = get_memory_stats()
+                        await ws.send_str(json.dumps({
+                            'type': 'memory_stats',
+                            'timestamp': datetime.now().isoformat(),
+                            **memory_stats
+                        }))
+                    
+                    elif data.get('type') == 'get_queue_stats':
+                        await ws.send_str(json.dumps({
+                            'type': 'queue_stats',
+                            'size': broadcast_queue.qsize(),
+                            'timestamp': datetime.now().isoformat()
+                        }))
                 
                 except json.JSONDecodeError:
                     await ws.send_str(json.dumps({
@@ -892,60 +934,52 @@ async def handle_data(request):
         'tables': tables
     })
 
-async def handle_command(request):
-    """处理命令请求"""
-    data = await request.json()
-    command = data.get('command')
+async def handle_memory_stats(request):
+    """处理内存统计请求"""
+    memory_stats = get_memory_stats()
     
-    if command == 'start':
-        # 启动监控逻辑
-        return web.json_response({'status': 'success', 'message': '监控已启动'})
-    
-    elif command == 'stop':
-        # 停止监控逻辑
-        return web.json_response({'status': 'success', 'message': '监控已停止'})
-    
-    return web.json_response({'status': 'error', 'message': '未知命令'})
+    return web.json_response({
+        'timestamp': datetime.now().isoformat(),
+        **memory_stats
+    })
 
-async def handle_export(request):
-    """处理导出请求"""
-    if not price_changes:
-        return web.json_response({'status': 'error', 'message': '没有数据可导出'})
+async def start_background_tasks(app):
+    """启动后台任务"""
+    app['broadcast_worker'] = asyncio.create_task(broadcast_worker())
     
-    try:
-        # 创建CSV文件
-        filename = f"okx_swap_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        
-        with open(filename, 'w', encoding='utf-8') as f:
-            f.write('产品ID,显示名称,涨跌幅(%),开盘价,收盘价,更新时间\n')
+    # 定期内存检查
+    async def memory_check():
+        while running:
+            await asyncio.sleep(MEMORY_CHECK_INTERVAL)
             
-            for inst_id, data in price_changes.items():
-                timestamp = datetime.fromtimestamp(data['timestamp']).strftime("%Y-%m-%d %H:%M:%S")
-                display_name = format_inst_id(inst_id)
-                f.write(f'{inst_id},{display_name},{data["change_rate"]:.2f},{data["open_price"]},{data["close_price"]},{timestamp}\n')
-        
-        return web.json_response({
-            'status': 'success', 
-            'message': f'数据已导出到: {filename}',
-            'filename': filename
-        })
+            memory_stats = get_memory_stats()
+            if memory_stats['memory_usage'] > 200:  # 超过200MB警告
+                print(f"内存使用警告: {memory_stats['memory_usage']:.1f} MB")
+                # 触发垃圾回收
+                gc.collect()
     
-    except Exception as e:
-        return web.json_response({'status': 'error', 'message': f'导出失败: {str(e)}'})
+    app['memory_check'] = asyncio.create_task(memory_check())
 
-def run_okx_websocket():
-    """在新的线程中运行OKX WebSocket"""
-    asyncio.run(okx_websocket_handler())
-
-def signal_handler(signum, frame):
-    """信号处理函数"""
-    global running
-    print(f"\n接收到信号 {signum}, 正在停止程序...")
-    running = False
+async def cleanup_background_tasks(app):
+    """清理后台任务"""
+    tasks = ['broadcast_worker', 'memory_check']
+    for task_name in tasks:
+        if task_name in app:
+            app[task_name].cancel()
+            try:
+                await app[task_name]
+            except:
+                pass
 
 async def init_app():
     """初始化应用"""
+    global main_event_loop
+    
     app = web.Application()
+    
+    # 保存主事件循环
+    main_event_loop = asyncio.get_event_loop()
+    print("主事件循环已保存")
     
     # 配置CORS
     cors = aiohttp_cors.setup(app, defaults={
@@ -960,22 +994,36 @@ async def init_app():
     app.router.add_get('/', handle_index)
     app.router.add_get('/ws', websocket_handler)
     app.router.add_get('/api/data', handle_data)
-    app.router.add_post('/api/command', handle_command)
-    app.router.add_get('/api/export', handle_export)
-    
-    # 配置静态文件（如果需要）
-    static_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
-    if not os.path.exists(static_path):
-        os.makedirs(static_path)
-        print(f"已创建静态文件目录: {static_path}")
-    
-    app.router.add_static('/static/', static_path, name='static')
+    app.router.add_get('/api/memory', handle_memory_stats)
     
     # 为所有路由配置CORS
     for route in list(app.router.routes()):
         cors.add(route)
     
+    # 注册启动和清理钩子
+    app.on_startup.append(start_background_tasks)
+    app.on_cleanup.append(cleanup_background_tasks)
+    
     return app
+
+def run_okx_websocket():
+    """在新的线程中运行OKX WebSocket"""
+    print("启动OKX WebSocket线程...")
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    try:
+        loop.run_until_complete(okx_websocket_handler())
+    except Exception as e:
+        print(f"OKX WebSocket线程错误: {e}")
+    finally:
+        loop.close()
+
+def signal_handler(signum, frame):
+    """信号处理函数"""
+    global running
+    print(f"\n接收到信号 {signum}, 正在停止程序...")
+    running = False
 
 def main():
     """主函数"""
@@ -986,6 +1034,7 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
     
     print("OKX SWAP 实时监控系统启动中...")
+    print(f"内存优化配置: 最大产品数={MAX_PRODUCTS}")
     
     # 启动OKX WebSocket线程
     ws_thread = threading.Thread(target=run_okx_websocket, daemon=True)
