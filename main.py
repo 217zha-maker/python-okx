@@ -779,7 +779,7 @@ def get_memory_stats():
 async def broadcast_worker():
     """广播工作者 - 内存优化版本"""
     last_broadcast_time = 0
-    broadcast_interval = 2  # 广播间隔（秒）
+    broadcast_interval = 1  # 广播间隔（秒）
     
     while running:
         try:
