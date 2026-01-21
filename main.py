@@ -1,4 +1,4 @@
-# okx_monitor_realtime_fixed.py
+# okx_monitor_realtime_fixed_no_latency.py
 import asyncio
 import json
 import time
@@ -109,7 +109,7 @@ def format_inst_id(inst_id):
         return inst_id.replace('-SWAP', '')
     return inst_id
 
-# HTML模板保持不变...
+# HTML模板（已移除 data-latency 相关部分）
 HTML_TEMPLATE = '''<!DOCTYPE html>
 <html>
 <head>
@@ -216,10 +216,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             <div class="stat-card">
                 <div style="font-size: 13px; color: var(--gray);">下跌产品</div>
                 <div class="stat-value negative" id="down-count">0</div>
-            </div>
-            <div class="stat-card">
-                <div style="font-size: 13px; color: var(--gray);">数据延迟</div>
-                <div class="stat-value" id="data-latency">0ms</div>
             </div>
         </div>
         
@@ -354,10 +350,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                     }
                     
                     document.getElementById('last-update').textContent = formatTime(new Date());
-                    if (data.timestamp) {
-                        const latency = new Date() - new Date(data.timestamp);
-                        document.getElementById('data-latency').textContent = Math.round(latency) + 'ms';
-                    }
                     
                 } catch (error) {
                     console.error('处理消息时出错:', error);
@@ -438,7 +430,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 const instId = item.inst_id || '';
                 let okxUrl = '';
                 if (instId) {
-                    // 转换为小写并替换到URL中
                     const formattedInstId = instId.toLowerCase();
                     okxUrl = `https://www.okx.com/zh-hans/trade-swap/${formattedInstId}`;
                 }
@@ -455,13 +446,10 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                     <td>${item.timestamp || '--:--:--'}</td>
                 `;
                 
-                // 添加可点击行样式
                 row.className = 'clickable-row';
                 
-                // 为整行添加点击事件
                 if (okxUrl) {
                     row.addEventListener('click', function(e) {
-                        // 检查点击的不是输入框或其他交互元素
                         if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' || 
                             e.target.tagName === 'SELECT' || e.target.tagName === 'TEXTAREA') {
                             return;
@@ -518,7 +506,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         }
         
         function showNotification(message, type) {
-            // 简单的控制台日志
             console.log(`${type.toUpperCase()}: ${message}`);
         }
         
@@ -558,25 +545,20 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             });
         }
         
-        // 页面加载完成后初始化
         document.addEventListener('DOMContentLoaded', () => {
             initWebSocket();
             initSearch();
             
-            // 每秒更新一次时间
             setInterval(() => {
                 if (ws && ws.readyState === WebSocket.OPEN) {
-                    // 定期请求内存统计
                     if (memoryMonitorVisible) {
                         ws.send(JSON.stringify({type: 'get_memory_stats'}));
                     }
-                    // 请求队列状态
                     ws.send(JSON.stringify({type: 'get_queue_stats'}));
                 }
             }, 1000);
         });
         
-        // 页面关闭前关闭WebSocket
         window.addEventListener('beforeunload', () => {
             if (ws && ws.readyState === WebSocket.OPEN) {
                 ws.close();
@@ -609,9 +591,7 @@ class MemoryOptimizedDataStore:
     def update(self, key, value):
         """更新数据，如果超过最大限制，删除最旧的数据"""
         with self.lock:
-            # 如果数据量超过限制，删除最旧的数据
             if len(self.data) >= self.max_items and key not in self.data:
-                # 找到最旧的数据（按最后更新时间）
                 if self.data:
                     oldest_key = min(self.data.keys(), 
                                    key=lambda k: self.data[k].get('last_update', 0))
@@ -641,11 +621,9 @@ class MemoryOptimizedDataStore:
         with self.lock:
             return len(self.data)
 
-# 使用优化的数据存储
 price_store = MemoryOptimizedDataStore(max_items=MAX_PRODUCTS)
 
 async def broadcast_connection_status():
-    """广播OKX连接状态"""
     if not clients:
         return
     
@@ -663,17 +641,14 @@ async def broadcast_connection_status():
         except:
             disconnected_clients.append(ws)
     
-    # 清理断开连接的客户端
     for ws in disconnected_clients:
         clients.discard(ws)
 
 async def okx_websocket_handler():
-    """OKX WebSocket处理器 - 修复版本，支持重连"""
     global main_event_loop, total_products, inst_ids, reconnect_attempts, ws_connection_active
     
     print("OKX WebSocket处理器启动...")
     
-    # 只获取主流币种，减少订阅数量
     main_pairs = [
         "BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP", 
         "BNB-USDT-SWAP", "XRP-USDT-SWAP", "ADA-USDT-SWAP",
@@ -684,19 +659,16 @@ async def okx_websocket_handler():
     ]
     
     def callback(message):
-        """WebSocket回调函数"""
         try:
             if isinstance(message, str):
                 data = json.loads(message)
             else:
                 data = message
             
-            # 处理订阅成功消息
             if "event" in data and data["event"] == "subscribe":
                 print(f"订阅成功: {data['arg']}")
                 return
             
-            # 处理K线数据
             if "data" in data and "arg" in data:
                 inst_id = data["arg"]["instId"]
                 kline_data = data["data"]
@@ -710,7 +682,6 @@ async def okx_websocket_handler():
                         
                         change_rate = calculate_change_rate(open_price, close_price)
                         
-                        # 更新数据存储
                         price_store.update(inst_id, {
                             'change_rate': change_rate,
                             'open_price': float(open_price),
@@ -718,18 +689,15 @@ async def okx_websocket_handler():
                             'timestamp': time.time()
                         })
                         
-                        # 更新最后收到数据的时间
                         last_received_time[inst_id] = time.time()
                         
-                        # 定期打印进度
                         collected = price_store.count()
                         if collected > 0 and collected % 10 == 0:
                             print(f"已收集 {collected}/{total_products} 个产品数据")
                         
-                        # 触发广播（非阻塞方式）
                         try:
                             if main_event_loop and main_event_loop.is_running():
-                                if broadcast_queue.qsize() < 50:  # 避免队列积压
+                                if broadcast_queue.qsize() < 50:
                                     asyncio.run_coroutine_threadsafe(
                                         broadcast_queue.put({
                                             'type': 'data_update',
@@ -745,23 +713,19 @@ async def okx_websocket_handler():
             traceback.print_exc()
     
     async def connect_and_subscribe():
-        """连接并订阅"""
         global reconnect_attempts, inst_ids, total_products, ws_connection_active
         
-        # 获取产品列表
         try:
             marketDataAPI = MarketData.MarketAPI(flag=flag)
             result = marketDataAPI.get_tickers(instType="SWAP")
             
             if result["code"] == "0":
                 all_products = [item["instId"] for item in result["data"]]
-                # 优先选择主流币种，然后补充其他币种
                 inst_ids = []
                 for pair in main_pairs:
                     if pair in all_products:
                         inst_ids.append(pair)
                 
-                # 补充其他产品，但总数不超过MAX_PRODUCTS
                 remaining_slots = MAX_PRODUCTS - len(inst_ids)
                 for product in all_products:
                     if product not in inst_ids and remaining_slots > 0:
@@ -776,74 +740,64 @@ async def okx_websocket_handler():
         total_products = len(inst_ids)
         print(f"选择监控 {total_products} 个产品")
         
-        # 连接WebSocket
         if await connection_manager.connect():
             ws_connection_active = True
             
-            # 分批订阅
-            batch_size = 10  # 减小批量大小，避免连接问题
+            batch_size = 10
             for i in range(0, len(inst_ids), batch_size):
                 batch = inst_ids[i:i+batch_size]
                 args = [{"channel": "candle1H", "instId": inst_id} for inst_id in batch]
                 
                 print(f"订阅批次 {i//batch_size + 1}，数量: {len(batch)}")
                 if await connection_manager.subscribe(args, callback):
-                    await asyncio.sleep(0.5)  # 每批之间等待0.5秒
+                    await asyncio.sleep(0.5)
                 else:
                     print(f"批次 {i//batch_size + 1} 订阅失败")
                     break
             
             print("订阅完成，等待初始数据...")
-            await asyncio.sleep(3)  # 等待初始数据
+            await asyncio.sleep(3)
             
             initial_received = price_store.count()
             print(f"初始推送后收到 {initial_received}/{total_products} 个产品数据")
             
-            # 广播连接状态
             if main_event_loop and main_event_loop.is_running():
                 asyncio.run_coroutine_threadsafe(broadcast_connection_status(), main_event_loop)
             
-            reconnect_attempts = 0  # 重置重连计数
+            reconnect_attempts = 0
             return True
         else:
             return False
     
-    # 主循环
     while running:
         try:
             print("正在建立OKX WebSocket连接...")
             if await connect_and_subscribe():
                 print("OKX WebSocket连接成功")
                 
-                # 保持连接，定期检查
                 last_data_time = time.time()
                 while running and connection_manager.is_connected():
                     await asyncio.sleep(1)
                     
-                    # 检查数据是否还在更新
                     current_time = time.time()
-                    if current_time - last_data_time > 60:  # 60秒没有数据
+                    if current_time - last_data_time > 60:
                         print("长时间没有收到数据，可能连接已断开")
                         break
                     
-                    # 如果有数据更新，重置计时器
                     if price_store.count() > 0:
                         last_data_time = current_time
                 
                 print("OKX WebSocket连接断开")
                 ws_connection_active = False
                 
-                # 广播连接状态
                 if main_event_loop and main_event_loop.is_running():
                     asyncio.run_coroutine_threadsafe(broadcast_connection_status(), main_event_loop)
             
-            # 断开连接
             await connection_manager.disconnect()
             
-            # 如果还在运行，等待后重连
             if running:
                 reconnect_attempts += 1
-                wait_time = min(RECONNECT_DELAY * reconnect_attempts, 60)  # 最多等待60秒
+                wait_time = min(RECONNECT_DELAY * reconnect_attempts, 60)
                 print(f"等待 {wait_time} 秒后重连... (尝试次数: {reconnect_attempts})")
                 await asyncio.sleep(wait_time)
                 
@@ -863,7 +817,6 @@ async def okx_websocket_handler():
     print("OKX WebSocket处理器停止")
 
 def get_statistics():
-    """获取统计数据"""
     try:
         data = price_store.get_all()
         collected = len(data)
@@ -899,14 +852,12 @@ def get_statistics():
         }
 
 def get_table_data():
-    """获取表格数据"""
     try:
         data = price_store.get_all()
         
         if not data:
             return {'gainers': [], 'losers': []}
         
-        # 涨幅榜
         gainers = []
         for inst_id, item in data.items():
             if item['change_rate'] > 0:
@@ -918,7 +869,6 @@ def get_table_data():
                     'timestamp': datetime.fromtimestamp(item['timestamp']).strftime("%H:%M:%S")
                 })
         
-        # 跌幅榜
         losers = []
         for inst_id, item in data.items():
             if item['change_rate'] < 0:
@@ -930,19 +880,17 @@ def get_table_data():
                     'timestamp': datetime.fromtimestamp(item['timestamp']).strftime("%H:%M:%S")
                 })
         
-        # 排序
         gainers.sort(key=lambda x: x['change_rate'], reverse=True)
         losers.sort(key=lambda x: x['change_rate'])
         
         return {
-            'gainers': gainers[:50],  # 最多显示50个
-            'losers': losers[:50]     # 最多显示50个
+            'gainers': gainers[:50],
+            'losers': losers[:50]
         }
     except:
         return {'gainers': [], 'losers': []}
 
 def get_memory_stats():
-    """获取内存统计信息"""
     import psutil
     import os
     
@@ -950,7 +898,6 @@ def get_memory_stats():
         process = psutil.Process(os.getpid())
         memory_info = process.memory_info()
         
-        # 转换为MB
         memory_mb = memory_info.rss / 1024 / 1024
         
         return {
@@ -961,7 +908,6 @@ def get_memory_stats():
             'clients': len(clients)
         }
     except:
-        # 如果psutil不可用，返回估计值
         return {
             'memory_usage': 0,
             'process_memory': 0,
@@ -971,29 +917,24 @@ def get_memory_stats():
         }
 
 async def broadcast_worker():
-    """广播工作者 - 内存优化版本"""
     last_broadcast_time = 0
-    broadcast_interval = 1  # 广播间隔（秒）
+    broadcast_interval = 1
     last_connection_status_time = 0
-    connection_status_interval = 5  # 连接状态广播间隔（秒）
+    connection_status_interval = 5
     
     while running:
         try:
             current_time = time.time()
             
-            # 检查是否有客户端
             if not clients:
                 await asyncio.sleep(1)
                 continue
             
-            # 定期广播连接状态
             if current_time - last_connection_status_time >= connection_status_interval:
                 await broadcast_connection_status()
                 last_connection_status_time = current_time
             
-            # 检查广播间隔
             if current_time - last_broadcast_time < broadcast_interval:
-                # 处理队列中的消息
                 try:
                     await asyncio.wait_for(broadcast_queue.get(), timeout=0.5)
                     broadcast_queue.task_done()
@@ -1003,7 +944,6 @@ async def broadcast_worker():
                 await asyncio.sleep(0.1)
                 continue
             
-            # 准备广播数据
             stats = get_statistics()
             tables = get_table_data()
             
@@ -1014,7 +954,6 @@ async def broadcast_worker():
                 'tables': tables
             })
             
-            # 发送给所有客户端
             disconnected_clients = []
             for ws in list(clients):
                 try:
@@ -1022,13 +961,11 @@ async def broadcast_worker():
                 except:
                     disconnected_clients.append(ws)
             
-            # 清理断开连接的客户端
             for ws in disconnected_clients:
                 clients.discard(ws)
             
             last_broadcast_time = current_time
             
-            # 触发垃圾回收
             if price_store.count() % 20 == 0:
                 gc.collect()
             
@@ -1039,17 +976,14 @@ async def broadcast_worker():
             await asyncio.sleep(1)
 
 async def websocket_handler(request):
-    """WebSocket处理器 - 内存优化版本"""
     ws = web.WebSocketResponse()
     await ws.prepare(request)
     
-    # 添加客户端
     clients.add(ws)
     client_count = len(clients)
     print(f"新客户端连接，当前客户端数: {client_count}")
     
     try:
-        # 立即发送当前数据和连接状态
         stats = get_statistics()
         tables = get_table_data()
         
@@ -1060,7 +994,6 @@ async def websocket_handler(request):
             'tables': tables
         }))
         
-        # 发送连接状态
         await ws.send_str(json.dumps({
             'type': 'okx_connection_status',
             'status': 'connected' if connection_manager.is_connected() else 'disconnected',
@@ -1130,18 +1063,15 @@ async def websocket_handler(request):
                 print(f'WebSocket错误: {ws.exception()}')
     
     finally:
-        # 移除客户端
         clients.discard(ws)
         print(f"客户端断开，当前客户端数: {len(clients)}")
     
     return ws
 
 async def handle_index(request):
-    """处理主页请求"""
     return web.Response(text=HTML_TEMPLATE, content_type='text/html')
 
 async def handle_data(request):
-    """处理数据API请求"""
     stats = get_statistics()
     tables = get_table_data()
     
@@ -1152,7 +1082,6 @@ async def handle_data(request):
     })
 
 async def handle_memory_stats(request):
-    """处理内存统计请求"""
     memory_stats = get_memory_stats()
     
     return web.json_response({
@@ -1161,24 +1090,20 @@ async def handle_memory_stats(request):
     })
 
 async def start_background_tasks(app):
-    """启动后台任务"""
     app['broadcast_worker'] = asyncio.create_task(broadcast_worker())
     
-    # 定期内存检查
     async def memory_check():
         while running:
             await asyncio.sleep(MEMORY_CHECK_INTERVAL)
             
             memory_stats = get_memory_stats()
-            if memory_stats['memory_usage'] > 200:  # 超过200MB警告
+            if memory_stats['memory_usage'] > 200:
                 print(f"内存使用警告: {memory_stats['memory_usage']:.1f} MB")
-                # 触发垃圾回收
                 gc.collect()
     
     app['memory_check'] = asyncio.create_task(memory_check())
 
 async def cleanup_background_tasks(app):
-    """清理后台任务"""
     tasks = ['broadcast_worker', 'memory_check']
     for task_name in tasks:
         if task_name in app:
@@ -1189,16 +1114,13 @@ async def cleanup_background_tasks(app):
                 pass
 
 async def init_app():
-    """初始化应用"""
     global main_event_loop
     
     app = web.Application()
     
-    # 保存主事件循环
     main_event_loop = asyncio.get_event_loop()
     print("主事件循环已保存")
     
-    # 配置CORS
     cors = aiohttp_cors.setup(app, defaults={
         "*": aiohttp_cors.ResourceOptions(
             allow_credentials=True,
@@ -1207,24 +1129,20 @@ async def init_app():
         )
     })
     
-    # 添加路由
     app.router.add_get('/', handle_index)
     app.router.add_get('/ws', websocket_handler)
     app.router.add_get('/api/data', handle_data)
     app.router.add_get('/api/memory', handle_memory_stats)
     
-    # 为所有路由配置CORS
     for route in list(app.router.routes()):
         cors.add(route)
     
-    # 注册启动和清理钩子
     app.on_startup.append(start_background_tasks)
     app.on_cleanup.append(cleanup_background_tasks)
     
     return app
 
 def run_okx_websocket():
-    """在新的线程中运行OKX WebSocket"""
     print("启动OKX WebSocket线程...")
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -1238,16 +1156,13 @@ def run_okx_websocket():
         loop.close()
 
 def signal_handler(signum, frame):
-    """信号处理函数"""
     global running
     print(f"\n接收到信号 {signum}, 正在停止程序...")
     running = False
 
 def main():
-    """主函数"""
     global running
     
-    # 注册信号处理
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
@@ -1255,7 +1170,6 @@ def main():
     print(f"内存优化配置: 最大产品数={MAX_PRODUCTS}")
     print(f"重连配置: 延迟={RECONNECT_DELAY}秒, 最大尝试={MAX_RECONNECT_ATTEMPTS}")
     
-    # 启动OKX WebSocket线程
     ws_thread = threading.Thread(target=run_okx_websocket, daemon=True)
     ws_thread.start()
     
@@ -1263,9 +1177,8 @@ def main():
     print("访问地址: http://localhost:8080")
     print("按 Ctrl+C 停止程序")
     
-    # 启动Web服务器
     try:
-        web.run_app(init_app(), host='0.0.0.0', port=8080, access_log=None)  # 关闭访问日志减少输出
+        web.run_app(init_app(), host='0.0.0.0', port=8080, access_log=None)
     except KeyboardInterrupt:
         print("程序被用户中断")
     except Exception as e:
