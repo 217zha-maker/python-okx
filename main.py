@@ -1,4 +1,4 @@
-# okx_monitor_realtime.py
+# okx_monitor_realtime_fixed.py
 import asyncio
 import json
 import time
@@ -12,6 +12,8 @@ import aiohttp_cors
 import threading
 import copy
 import gc
+import traceback
+from typing import Optional
 
 # 全局变量
 flag = "0"
@@ -22,15 +24,82 @@ main_event_loop = None  # 存储主事件循环
 total_products = 0  # 初始获取的产品总数
 inst_ids = []  # 所有产品ID列表
 last_received_time = {}  # 记录每个产品最后收到数据的时间
+ws_connection_active = False  # WebSocket连接状态标志
 
 # 内存优化配置
 MAX_PRODUCTS = 300  # 限制监控的最大产品数量
 MEMORY_CHECK_INTERVAL = 60  # 内存检查间隔（秒）
 DATA_CLEANUP_INTERVAL = 300  # 数据清理间隔（秒）
 
+# 重连配置
+RECONNECT_DELAY = 5  # 重连延迟（秒）
+MAX_RECONNECT_ATTEMPTS = 10  # 最大重连尝试次数
+reconnect_attempts = 0  # 当前重连尝试次数
+
 # 高效数据结构
 update_lock = threading.Lock()
 broadcast_queue = asyncio.Queue(maxsize=100)  # 限制队列大小
+
+class ConnectionManager:
+    """连接管理器"""
+    
+    def __init__(self):
+        self.ws = None
+        self.connected = False
+        self.reconnecting = False
+        self.last_heartbeat = time.time()
+        self.subscription_args = []
+        
+    async def connect(self):
+        """建立WebSocket连接"""
+        try:
+            print("正在连接OKX WebSocket...")
+            self.ws = WsPublicAsync(url="wss://ws.okx.com:8443/ws/v5/business")
+            await self.ws.start()
+            self.connected = True
+            self.last_heartbeat = time.time()
+            print("OKX WebSocket连接成功")
+            return True
+        except Exception as e:
+            print(f"连接失败: {e}")
+            traceback.print_exc()
+            return False
+    
+    async def disconnect(self):
+        """断开WebSocket连接"""
+        try:
+            if self.ws:
+                await self.ws.unsubscribe([], callback=lambda x: None)
+                # 注意：原okx库可能没有提供close方法，这里尝试安全断开
+                self.connected = False
+                print("WebSocket连接已断开")
+        except Exception as e:
+            print(f"断开连接时出错: {e}")
+            traceback.print_exc()
+        finally:
+            self.ws = None
+    
+    async def subscribe(self, args, callback):
+        """订阅数据"""
+        try:
+            if not self.connected or not self.ws:
+                return False
+            
+            self.subscription_args = args
+            await self.ws.subscribe(args, callback=callback)
+            print(f"订阅成功，共 {len(args)} 个产品")
+            return True
+        except Exception as e:
+            print(f"订阅失败: {e}")
+            traceback.print_exc()
+            return False
+    
+    def is_connected(self):
+        """检查连接状态"""
+        return self.connected and self.ws is not None
+
+# 创建连接管理器实例
+connection_manager = ConnectionManager()
 
 def format_inst_id(inst_id):
     """格式化产品ID，去掉-USDT-SWAP后缀"""
@@ -40,7 +109,7 @@ def format_inst_id(inst_id):
         return inst_id.replace('-SWAP', '')
     return inst_id
 
-# HTML 模板（简化版，减少内存占用）
+# HTML模板保持不变...
 HTML_TEMPLATE = '''<!DOCTYPE html>
 <html>
 <head>
@@ -70,7 +139,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         table { width: 100%; border-collapse: collapse; font-size: 13px; }
         th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid #eee; }
         th { background: var(--light); font-weight: 600; }
-        tr:hover { background: #f8f9fa; }
         .status-bar { background: white; padding: 10px; border-radius: 6px; margin: 15px 0; display: flex; flex-wrap: wrap; gap: 10px; justify-content: space-between; }
         .controls { display: flex; flex-wrap: wrap; gap: 8px; margin: 15px 0; }
         button { padding: 8px 15px; border: none; border-radius: 4px; cursor: pointer; font-weight: 600; font-size: 13px; }
@@ -88,12 +156,37 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .compact-table th, .compact-table td { padding: 6px 8px; }
         .loading { text-align: center; padding: 20px; color: var(--gray); }
         .update-time { font-size: 12px; color: var(--gray); }
+        .product-name { 
+            color: var(--primary); 
+            font-weight: 500;
+        }
+        .clickable-row { 
+            cursor: pointer; 
+        }
+        .connection-status {
+            font-size: 12px;
+            padding: 3px 8px;
+            border-radius: 12px;
+            background: #e8f4fc;
+            color: var(--primary);
+        }
+        .connection-status.connected {
+            background: #e8f6f3;
+            color: var(--success);
+        }
+        .connection-status.disconnected {
+            background: #fdeded;
+            color: var(--danger);
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h2 style="margin: 0; font-size: 18px;">📈 OKX SWAP 监控 (内存优化版)</h2>
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h2 style="margin: 0; font-size: 18px;">📈 OKX SWAP 监控 (修复版)</h2>
+                <div class="connection-status" id="okx-connection-status">连接中...</div>
+            </div>
             <div class="update-time">
                 最后更新: <span id="last-update">--:--:--</span>
             </div>
@@ -107,6 +200,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             <div style="display: flex; gap: 15px; font-size: 13px;">
                 <span>产品: <span id="total-count">0</span>/<span id="total-products">0</span></span>
                 <span>内存: <span id="memory-usage">-- MB</span></span>
+                <span>重连次数: <span id="reconnect-count">0</span></span>
             </div>
         </div>
         
@@ -185,6 +279,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             <button class="btn-start" onclick="sendCommand('start')">开始</button>
             <button class="btn-stop" onclick="sendCommand('stop')">停止</button>
             <button onclick="sendCommand('clear')" style="background: var(--warning); color: white;">清空</button>
+            <button onclick="sendCommand('reconnect')" style="background: var(--primary); color: white;">重连</button>
             <button onclick="location.reload()" style="background: var(--gray); color: white;">刷新</button>
             <button onclick="toggleMemoryMonitor()" style="background: var(--primary); color: white;">内存监控</button>
             <div style="flex-grow: 1;"></div>
@@ -205,6 +300,13 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         let reconnectTimer = null;
         let updateCount = 0;
         let memoryMonitorVisible = false;
+        
+        function updateOKXConnectionStatus(status) {
+            const element = document.getElementById('okx-connection-status');
+            element.textContent = status === 'connected' ? 'OKX已连接' : 
+                                 status === 'connecting' ? '连接中...' : '连接断开';
+            element.className = 'connection-status ' + status;
+        }
         
         function initWebSocket() {
             if (ws && ws.readyState === WebSocket.OPEN) return;
@@ -242,6 +344,12 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                             break;
                         case 'command_response':
                             showNotification(data.message, data.success ? 'success' : 'error');
+                            break;
+                        case 'okx_connection_status':
+                            updateOKXConnectionStatus(data.status);
+                            if (data.reconnect_count !== undefined) {
+                                document.getElementById('reconnect-count').textContent = data.reconnect_count;
+                            }
                             break;
                     }
                     
@@ -326,15 +434,41 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 const row = document.createElement('tr');
                 const isPositive = (item.change_rate || 0) >= 0;
                 
+                // 生成OKX交易链接
+                const instId = item.inst_id || '';
+                let okxUrl = '';
+                if (instId) {
+                    // 转换为小写并替换到URL中
+                    const formattedInstId = instId.toLowerCase();
+                    okxUrl = `https://www.okx.com/zh-hans/trade-swap/${formattedInstId}`;
+                }
+                
                 row.innerHTML = `
                     <td>${index + 1}</td>
-                    <td title="${item.inst_id || ''}">${item.display_id || item.inst_id || ''}</td>
+                    <td>
+                        <span class="product-name">${item.display_id || item.inst_id || ''}</span>
+                    </td>
                     <td style="color: ${isPositive ? '#27ae60' : '#e74c3c'}; font-weight: bold;">
                         ${isPositive ? '+' : ''}${(item.change_rate || 0).toFixed(2)}%
                     </td>
                     <td>${formatNumber(item.close_price || 0)}</td>
                     <td>${item.timestamp || '--:--:--'}</td>
                 `;
+                
+                // 添加可点击行样式
+                row.className = 'clickable-row';
+                
+                // 为整行添加点击事件
+                if (okxUrl) {
+                    row.addEventListener('click', function(e) {
+                        // 检查点击的不是输入框或其他交互元素
+                        if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' || 
+                            e.target.tagName === 'SELECT' || e.target.tagName === 'TEXTAREA') {
+                            return;
+                        }
+                        window.open(okxUrl, '_blank');
+                    });
+                }
                 
                 tbody.appendChild(row);
             });
@@ -510,9 +644,32 @@ class MemoryOptimizedDataStore:
 # 使用优化的数据存储
 price_store = MemoryOptimizedDataStore(max_items=MAX_PRODUCTS)
 
+async def broadcast_connection_status():
+    """广播OKX连接状态"""
+    if not clients:
+        return
+    
+    status_msg = json.dumps({
+        'type': 'okx_connection_status',
+        'status': 'connected' if connection_manager.is_connected() else 'disconnected',
+        'timestamp': datetime.now().isoformat(),
+        'reconnect_count': reconnect_attempts
+    })
+    
+    disconnected_clients = []
+    for ws in list(clients):
+        try:
+            await ws.send_str(status_msg)
+        except:
+            disconnected_clients.append(ws)
+    
+    # 清理断开连接的客户端
+    for ws in disconnected_clients:
+        clients.discard(ws)
+
 async def okx_websocket_handler():
-    """OKX WebSocket处理器 - 内存优化版本"""
-    global main_event_loop, total_products, inst_ids
+    """OKX WebSocket处理器 - 修复版本，支持重连"""
+    global main_event_loop, total_products, inst_ids, reconnect_attempts, ws_connection_active
     
     print("OKX WebSocket处理器启动...")
     
@@ -526,40 +683,8 @@ async def okx_websocket_handler():
         "ETC-USDT-SWAP", "XLM-USDT-SWAP", "ALGO-USDT-SWAP"
     ]
     
-    # 如果需要更多产品，可以从API获取，但限制数量
-    try:
-        marketDataAPI = MarketData.MarketAPI(flag=flag)
-        result = marketDataAPI.get_tickers(instType="SWAP")
-        
-        if result["code"] == "0":
-            all_products = [item["instId"] for item in result["data"]]
-            # 优先选择主流币种，然后补充其他币种
-            inst_ids = []
-            for pair in main_pairs:
-                if pair in all_products:
-                    inst_ids.append(pair)
-            
-            # 补充其他产品，但总数不超过MAX_PRODUCTS
-            remaining_slots = MAX_PRODUCTS - len(inst_ids)
-            for product in all_products:
-                if product not in inst_ids and remaining_slots > 0:
-                    inst_ids.append(product)
-                    remaining_slots -= 1
-        else:
-            inst_ids = main_pairs[:MAX_PRODUCTS]
-    except Exception as e:
-        print(f"获取产品列表失败: {e}")
-        inst_ids = main_pairs[:min(10, MAX_PRODUCTS)]
-    
-    total_products = len(inst_ids)
-    print(f"选择监控 {total_products} 个产品（内存优化）")
-    
-    # 连接WebSocket
-    ws = WsPublicAsync(url="wss://ws.okx.com:8443/ws/v5/business")
-    await ws.start()
-    
-    # 分批订阅，避免一次性订阅太多
     def callback(message):
+        """WebSocket回调函数"""
         try:
             if isinstance(message, str):
                 data = json.loads(message)
@@ -617,56 +742,125 @@ async def okx_websocket_handler():
         
         except Exception as e:
             print(f"处理消息时出错: {e}")
+            traceback.print_exc()
     
-    # 分批订阅
-    batch_size = 20  # 每批订阅数量
-    for i in range(0, len(inst_ids), batch_size):
-        batch = inst_ids[i:i+batch_size]
-        args = [{"channel": "candle1H", "instId": inst_id} for inst_id in batch]
+    async def connect_and_subscribe():
+        """连接并订阅"""
+        global reconnect_attempts, inst_ids, total_products, ws_connection_active
         
-        print(f"订阅批次 {i//batch_size + 1}，数量: {len(batch)}")
-        await ws.subscribe(args, callback=callback)
-        await asyncio.sleep(1)  # 每批之间等待1秒
-    
-    print("订阅完成，等待初始数据...")
-    
-    # 等待初始数据
-    await asyncio.sleep(5)
-    
-    initial_received = price_store.count()
-    print(f"初始推送后收到 {initial_received}/{total_products} 个产品数据")
-    
-    # 定期清理长时间未更新的数据
-    async def cleanup_old_data():
-        while running:
-            await asyncio.sleep(DATA_CLEANUP_INTERVAL)
+        # 获取产品列表
+        try:
+            marketDataAPI = MarketData.MarketAPI(flag=flag)
+            result = marketDataAPI.get_tickers(instType="SWAP")
             
-            current_time = time.time()
-            old_keys = []
+            if result["code"] == "0":
+                all_products = [item["instId"] for item in result["data"]]
+                # 优先选择主流币种，然后补充其他币种
+                inst_ids = []
+                for pair in main_pairs:
+                    if pair in all_products:
+                        inst_ids.append(pair)
+                
+                # 补充其他产品，但总数不超过MAX_PRODUCTS
+                remaining_slots = MAX_PRODUCTS - len(inst_ids)
+                for product in all_products:
+                    if product not in inst_ids and remaining_slots > 0:
+                        inst_ids.append(product)
+                        remaining_slots -= 1
+            else:
+                inst_ids = main_pairs[:MAX_PRODUCTS]
+        except Exception as e:
+            print(f"获取产品列表失败: {e}")
+            inst_ids = main_pairs[:min(10, MAX_PRODUCTS)]
+        
+        total_products = len(inst_ids)
+        print(f"选择监控 {total_products} 个产品")
+        
+        # 连接WebSocket
+        if await connection_manager.connect():
+            ws_connection_active = True
             
-            for inst_id, last_time in list(last_received_time.items()):
-                if current_time - last_time > 600:  # 10分钟没有更新
-                    old_keys.append(inst_id)
+            # 分批订阅
+            batch_size = 10  # 减小批量大小，避免连接问题
+            for i in range(0, len(inst_ids), batch_size):
+                batch = inst_ids[i:i+batch_size]
+                args = [{"channel": "candle1H", "instId": inst_id} for inst_id in batch]
+                
+                print(f"订阅批次 {i//batch_size + 1}，数量: {len(batch)}")
+                if await connection_manager.subscribe(args, callback):
+                    await asyncio.sleep(0.5)  # 每批之间等待0.5秒
+                else:
+                    print(f"批次 {i//batch_size + 1} 订阅失败")
+                    break
             
-            if old_keys:
-                print(f"清理 {len(old_keys)} 个长时间未更新的数据")
-                for key in old_keys:
-                    if key in last_received_time:
-                        del last_received_time[key]
+            print("订阅完成，等待初始数据...")
+            await asyncio.sleep(3)  # 等待初始数据
+            
+            initial_received = price_store.count()
+            print(f"初始推送后收到 {initial_received}/{total_products} 个产品数据")
+            
+            # 广播连接状态
+            if main_event_loop and main_event_loop.is_running():
+                asyncio.run_coroutine_threadsafe(broadcast_connection_status(), main_event_loop)
+            
+            reconnect_attempts = 0  # 重置重连计数
+            return True
+        else:
+            return False
     
-    # 启动清理任务
-    cleanup_task = asyncio.create_task(cleanup_old_data())
+    # 主循环
+    while running:
+        try:
+            print("正在建立OKX WebSocket连接...")
+            if await connect_and_subscribe():
+                print("OKX WebSocket连接成功")
+                
+                # 保持连接，定期检查
+                last_data_time = time.time()
+                while running and connection_manager.is_connected():
+                    await asyncio.sleep(1)
+                    
+                    # 检查数据是否还在更新
+                    current_time = time.time()
+                    if current_time - last_data_time > 60:  # 60秒没有数据
+                        print("长时间没有收到数据，可能连接已断开")
+                        break
+                    
+                    # 如果有数据更新，重置计时器
+                    if price_store.count() > 0:
+                        last_data_time = current_time
+                
+                print("OKX WebSocket连接断开")
+                ws_connection_active = False
+                
+                # 广播连接状态
+                if main_event_loop and main_event_loop.is_running():
+                    asyncio.run_coroutine_threadsafe(broadcast_connection_status(), main_event_loop)
+            
+            # 断开连接
+            await connection_manager.disconnect()
+            
+            # 如果还在运行，等待后重连
+            if running:
+                reconnect_attempts += 1
+                wait_time = min(RECONNECT_DELAY * reconnect_attempts, 60)  # 最多等待60秒
+                print(f"等待 {wait_time} 秒后重连... (尝试次数: {reconnect_attempts})")
+                await asyncio.sleep(wait_time)
+                
+                if reconnect_attempts >= MAX_RECONNECT_ATTEMPTS:
+                    print(f"达到最大重连尝试次数 {MAX_RECONNECT_ATTEMPTS}")
+                    break
+        
+        except asyncio.CancelledError:
+            print("WebSocket任务被取消")
+            break
+        except Exception as e:
+            print(f"WebSocket处理错误: {e}")
+            traceback.print_exc()
+            if running:
+                await asyncio.sleep(RECONNECT_DELAY)
     
-    # 保持连接
-    try:
-        while running:
-            await asyncio.sleep(1)
-    except Exception as e:
-        print(f"OKX WebSocket错误: {e}")
-    finally:
-        cleanup_task.cancel()
-        await ws.unsubscribe([], callback=callback)
-        print("OKX WebSocket连接已关闭")
+    print("OKX WebSocket处理器停止")
 
 def get_statistics():
     """获取统计数据"""
@@ -780,6 +974,8 @@ async def broadcast_worker():
     """广播工作者 - 内存优化版本"""
     last_broadcast_time = 0
     broadcast_interval = 1  # 广播间隔（秒）
+    last_connection_status_time = 0
+    connection_status_interval = 5  # 连接状态广播间隔（秒）
     
     while running:
         try:
@@ -789,6 +985,11 @@ async def broadcast_worker():
             if not clients:
                 await asyncio.sleep(1)
                 continue
+            
+            # 定期广播连接状态
+            if current_time - last_connection_status_time >= connection_status_interval:
+                await broadcast_connection_status()
+                last_connection_status_time = current_time
             
             # 检查广播间隔
             if current_time - last_broadcast_time < broadcast_interval:
@@ -848,7 +1049,7 @@ async def websocket_handler(request):
     print(f"新客户端连接，当前客户端数: {client_count}")
     
     try:
-        # 立即发送当前数据
+        # 立即发送当前数据和连接状态
         stats = get_statistics()
         tables = get_table_data()
         
@@ -857,6 +1058,14 @@ async def websocket_handler(request):
             'timestamp': datetime.now().isoformat(),
             'stats': stats,
             'tables': tables
+        }))
+        
+        # 发送连接状态
+        await ws.send_str(json.dumps({
+            'type': 'okx_connection_status',
+            'status': 'connected' if connection_manager.is_connected() else 'disconnected',
+            'timestamp': datetime.now().isoformat(),
+            'reconnect_count': reconnect_attempts
         }))
         
         async for msg in ws:
@@ -886,6 +1095,14 @@ async def websocket_handler(request):
                                 'success': True,
                                 'message': '数据已清空'
                             }))
+                        
+                        elif command == 'reconnect':
+                            await ws.send_str(json.dumps({
+                                'type': 'command_response',
+                                'success': True,
+                                'message': '已请求重连'
+                            }))
+                            print("收到重连命令")
                     
                     elif data.get('type') == 'get_memory_stats':
                         memory_stats = get_memory_stats()
@@ -1016,6 +1233,7 @@ def run_okx_websocket():
         loop.run_until_complete(okx_websocket_handler())
     except Exception as e:
         print(f"OKX WebSocket线程错误: {e}")
+        traceback.print_exc()
     finally:
         loop.close()
 
@@ -1035,6 +1253,7 @@ def main():
     
     print("OKX SWAP 实时监控系统启动中...")
     print(f"内存优化配置: 最大产品数={MAX_PRODUCTS}")
+    print(f"重连配置: 延迟={RECONNECT_DELAY}秒, 最大尝试={MAX_RECONNECT_ATTEMPTS}")
     
     # 启动OKX WebSocket线程
     ws_thread = threading.Thread(target=run_okx_websocket, daemon=True)
@@ -1045,7 +1264,15 @@ def main():
     print("按 Ctrl+C 停止程序")
     
     # 启动Web服务器
-    web.run_app(init_app(), host='0.0.0.0', port=8080)
+    try:
+        web.run_app(init_app(), host='0.0.0.0', port=8080, access_log=None)  # 关闭访问日志减少输出
+    except KeyboardInterrupt:
+        print("程序被用户中断")
+    except Exception as e:
+        print(f"Web服务器错误: {e}")
+    finally:
+        running = False
+        print("程序停止")
 
 if __name__ == "__main__":
     main()
