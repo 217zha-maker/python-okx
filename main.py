@@ -15,6 +15,9 @@ import gc
 import traceback
 from typing import Optional
 from collections import deque
+import requests
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
 
 # 全局变量
 flag = "0"
@@ -39,8 +42,8 @@ RECONNECT_DELAY = 5  # 重连延迟（秒）
 MAX_RECONNECT_ATTEMPTS = 10  # 最大重连尝试次数
 reconnect_attempts = 0  # 当前重连尝试次数
 
-# API请求频率控制 - 优化为0.11秒一次
-API_RATE_LIMIT_DELAY = 0.11  # API请求间隔（秒），0.11秒=约9次/秒
+# API请求频率控制 - 优化为0.3秒一次，避免连接被终止
+API_RATE_LIMIT_DELAY = 0.3  # API请求间隔（秒），0.3秒=约3.3次/秒
 API_BATCH_SIZE = 1  # 每次只更新一个产品，实现连续更新
 
 # 高效数据结构
@@ -64,6 +67,25 @@ class ConnectionManager:
         self.last_api_call = 0  # 上次API调用时间
         self.api_request_count = 0  # API请求计数器
         self.api_request_reset_time = time.time()  # 重置计数器的时间
+        self.session = None  # 添加session用于API请求
+        
+    def _get_session(self):
+        """创建并配置requests session"""
+        if self.session is None:
+            self.session = requests.Session()
+            # 配置重试策略
+            retry_strategy = Retry(
+                total=3,  # 最大重试次数
+                backoff_factor=1,  # 退避因子
+                status_forcelist=[429, 500, 502, 503, 504],  # 需要重试的状态码
+                allowed_methods=["GET"]  # 只重试GET请求
+            )
+            adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=10, pool_maxsize=10)
+            self.session.mount("http://", adapter)
+            self.session.mount("https://", adapter)
+            # 设置超时
+            self.session.timeout = 10  # 10秒超时
+        return self.session
         
     async def connect(self):
         """建立WebSocket连接"""
@@ -115,7 +137,7 @@ class ConnectionManager:
     def get_market_api(self):
         """获取MarketAPI实例（延迟创建）"""
         if self.market_api is None:
-            self.market_api = MarketData.MarketAPI(flag=flag)
+            self.market_api = MarketData.MarketAPI(flag=flag, debug=False)
         return self.market_api
     
     def get_ticker_data_with_rate_limit(self, inst_id):
@@ -131,10 +153,12 @@ class ConnectionManager:
             
             # 确保不超过频率限制
             if self.api_request_count >= 18:  # 留2次余量
-                print(f"接近API频率限制，等待重置... 当前计数: {self.api_request_count}")
-                time.sleep(2.1 - (current_time - self.api_request_reset_time))
-                self.api_request_count = 0
-                self.api_request_reset_time = time.time()
+                wait_time = 2.1 - (current_time - self.api_request_reset_time)
+                if wait_time > 0:
+                    print(f"接近API频率限制，等待{wait_time:.2f}秒... 当前计数: {self.api_request_count}")
+                    time.sleep(wait_time)
+                    self.api_request_count = 0
+                    self.api_request_reset_time = time.time()
             
             # 确保最小请求间隔
             elapsed = current_time - self.last_api_call
@@ -146,16 +170,35 @@ class ConnectionManager:
             self.last_api_call = time.time()
             self.api_request_count += 1
             
-            if result["code"] == "0" and result["data"]:
+            if result and result.get("code") == "0" and result.get("data"):
                 return result["data"][0]
             else:
-                if result.get("code") == "50011":  # Too Many Requests
+                error_code = result.get("code") if result else "unknown"
+                error_msg = result.get("msg") if result else "No response"
+                
+                if error_code == "50011":  # Too Many Requests
                     print(f"API频率限制触发，等待2秒...")
                     time.sleep(2.1)
-                    return self.get_ticker_data_with_rate_limit(inst_id)  # 重试一次
-                elif result.get("code") != "0":
-                    print(f"获取 {inst_id} ticker数据失败: {result}")
+                    # 重试一次
+                    return self.get_ticker_data_with_rate_limit(inst_id)
+                elif error_code == "50113":  # System error
+                    print(f"系统错误，等待1秒后重试...")
+                    time.sleep(1)
+                    return self.get_ticker_data_with_rate_limit(inst_id)
+                elif error_code != "0":
+                    print(f"获取 {inst_id} ticker数据失败: 代码={error_code}, 消息={error_msg}")
                 return None
+                
+        except requests.exceptions.ConnectionError as e:
+            print(f"获取 {inst_id} ticker数据时连接错误: {e}")
+            # 连接错误，等待1秒后重试
+            time.sleep(1)
+            return self.get_ticker_data_with_rate_limit(inst_id)
+        except requests.exceptions.Timeout as e:
+            print(f"获取 {inst_id} ticker数据时超时: {e}")
+            # 超时，等待1秒后重试
+            time.sleep(1)
+            return self.get_ticker_data_with_rate_limit(inst_id)
         except Exception as e:
             print(f"获取 {inst_id} ticker数据时出错: {e}")
             return None
@@ -231,7 +274,7 @@ def calculate_change_rate(open_price, close_price):
     except (ValueError, TypeError):
         return 0
 
-async def update_single_volume(inst_id):
+async def update_single_volume(inst_id, retry_count=0):
     """更新单个产品的24h成交量数据"""
     try:
         ticker_data = connection_manager.get_ticker_data_with_rate_limit(inst_id)
@@ -250,21 +293,34 @@ async def update_single_volume(inst_id):
             
             return True
         else:
-            return False
+            # 如果失败，尝试重试（最多3次）
+            if retry_count < 3:
+                print(f"第{retry_count+1}次重试获取 {inst_id} 成交量数据...")
+                await asyncio.sleep(1)  # 等待1秒后重试
+                return await update_single_volume(inst_id, retry_count + 1)
+            else:
+                print(f"获取 {inst_id} 成交量数据失败，已达到最大重试次数")
+                return False
     except Exception as e:
         print(f"更新 {inst_id} 24h成交量时出错: {e}")
+        if retry_count < 3:
+            await asyncio.sleep(1)
+            return await update_single_volume(inst_id, retry_count + 1)
         return False
 
 async def continuous_volume_updater():
-    """连续更新24h成交量数据 - 每0.11秒更新一个产品"""
+    """连续更新24h成交量数据 - 每0.3秒更新一个产品"""
     global volume_update_queue, volume_update_in_progress, inst_ids
     
     print("启动连续成交量更新器...")
     
+    # 初始化队列
+    volume_update_queue = deque(inst_ids)
+    
     while running and connection_manager.is_connected():
         try:
-            # 如果队列为空，初始化队列
             if not volume_update_queue:
+                # 重新填充队列
                 volume_update_queue = deque(inst_ids)
             
             # 从队列中取出一个产品
@@ -276,8 +332,13 @@ async def continuous_volume_updater():
             if success:
                 # 更新完成后，将这个产品放回队列末尾，以便下次更新
                 volume_update_queue.append(inst_id)
+            else:
+                # 如果更新失败，也放回队列末尾，稍后重试
+                volume_update_queue.append(inst_id)
+                # 等待稍长时间再继续
+                await asyncio.sleep(1)
             
-            # 等待0.11秒后更新下一个产品
+            # 等待0.3秒后更新下一个产品
             await asyncio.sleep(API_RATE_LIMIT_DELAY)
             
         except Exception as e:
@@ -319,9 +380,6 @@ async def batch_update_volumes():
             # 每个请求之间添加延迟，避免频率限制
             await asyncio.sleep(API_RATE_LIMIT_DELAY)
         
-        # 每批之间等待2秒，确保API频率限制
-        await asyncio.sleep(2)
-        
         # 更新前端显示
         if main_event_loop and main_event_loop.is_running():
             asyncio.run_coroutine_threadsafe(
@@ -329,7 +387,7 @@ async def batch_update_volumes():
                 main_event_loop
             )
     
-    print(f"24h成交量更新完成: 成功 {success_count}, 失败 {fail_count}")
+    print(f"24h成交量批量更新完成: 成功 {success_count}, 失败 {fail_count}")
     return success_count
 
 async def broadcast_volume_stats():
@@ -391,6 +449,7 @@ class MemoryOptimizedDataStore:
             # 合并现有数据和新的数据
             existing = self.data.get(key, {})
             merged_data = {
+                'inst_id': key,
                 'change_rate': value.get('change_rate', existing.get('change_rate', 0)),
                 'close_price': value.get('close_price', existing.get('close_price', 0)),
                 'open_price': value.get('open_price', existing.get('open_price', 0)),
@@ -516,10 +575,10 @@ async def okx_websocket_handler():
         global reconnect_attempts, inst_ids, total_products, ws_connection_active
         
         try:
-            marketDataAPI = MarketData.MarketAPI(flag=flag)
+            marketDataAPI = MarketData.MarketAPI(flag=flag, debug=False)
             result = marketDataAPI.get_tickers(instType="SWAP")
             
-            if result["code"] == "0":
+            if result and result.get("code") == "0":
                 all_products = [item["instId"] for item in result["data"]]
                 inst_ids = []
                 for pair in main_pairs:
@@ -1023,7 +1082,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
     <div class="container">
         <div class="header">
             <div style="display: flex; justify-content: space-between; align-items: center;">
-                <h2 style="margin: 0; font-size: 18px;">📈 OKX SWAP 监控 (修复版)</h2>
+                <h2 style="margin: 0; font-size: 18px;">📈 OKX SWAP 监控 (稳定版)</h2>
                 <div class="connection-status" id="okx-connection-status">连接中...</div>
             </div>
             <div class="update-time">
@@ -1837,9 +1896,10 @@ def main():
     print("OKX SWAP 实时监控系统启动中...")
     print(f"内存优化配置: 最大产品数={MAX_PRODUCTS}")
     print(f"重连配置: 延迟={RECONNECT_DELAY}秒, 最大尝试={MAX_RECONNECT_ATTEMPTS}")
-    print(f"API频率控制: 请求间隔={API_RATE_LIMIT_DELAY}秒 (每0.11秒更新一个产品)")
-    print("注意: 24h成交量数据采用连续更新模式，每0.11秒更新一个产品")
+    print(f"API频率控制: 请求间隔={API_RATE_LIMIT_DELAY}秒 (每0.3秒更新一个产品)")
+    print("注意: 24h成交量数据采用连续更新模式，每0.3秒更新一个产品")
     print("优化: 修复了排序逻辑和页面卡顿问题，提升了页面性能")
+    print("修复: 增加了API请求的重试机制和连接错误处理")
     
     ws_thread = threading.Thread(target=run_okx_websocket, daemon=True)
     ws_thread.start()
