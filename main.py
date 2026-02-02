@@ -4,8 +4,10 @@ import json
 import time
 import signal
 import os
-from datetime import datetime
+import sys
+from datetime import datetime, timedelta
 import okx.MarketData as MarketData
+import okx.TradingData as TradingData_api
 from okx.websocket.WsPublicAsync import WsPublicAsync
 from aiohttp import web
 import aiohttp_cors
@@ -29,8 +31,12 @@ total_products = 0  # 初始获取的产品总数
 inst_ids = []  # 所有产品ID列表
 last_received_time = {}  # 记录每个产品最后收到数据的时间
 ws_connection_active = False  # WebSocket连接状态标志
+ws_oi_connection_active = False  # 持仓量WebSocket连接状态标志
 volume_24h_data = {}  # 存储24小时成交量数据
 volume_last_update = {}  # 记录每个产品24h成交量的最后更新时间
+oi_data = {}  # 存储实时持仓量数据
+oi_history_data = {}  # 存储历史持仓量数据
+oi_last_update = {}  # 记录每个产品持仓量的最后更新时间
 
 # 内存优化配置
 MAX_PRODUCTS = 300  # 限制监控的最大产品数量
@@ -41,9 +47,10 @@ DATA_CLEANUP_INTERVAL = 300  # 数据清理间隔（秒）
 RECONNECT_DELAY = 5  # 重连延迟（秒）
 MAX_RECONNECT_ATTEMPTS = 10  # 最大重连尝试次数
 reconnect_attempts = 0  # 当前重连尝试次数
+oi_reconnect_attempts = 0  # 持仓量重连尝试次数
 
 # API请求频率控制 - 优化为0.3秒一次，避免连接被终止
-API_RATE_LIMIT_DELAY = 0.3  # API请求间隔（秒），0.3秒=约3.3次/秒
+API_RATE_LIMIT_DELAY = 0.2  # API请求间隔（秒），0.3秒=约3.3次/秒
 API_BATCH_SIZE = 1  # 每次只更新一个产品，实现连续更新
 
 # 高效数据结构
@@ -57,17 +64,23 @@ volume_update_in_progress = False  # 成交量更新是否正在进行中
 class ConnectionManager:
     """连接管理器"""
     
-    def __init__(self):
+    def __init__(self, url="wss://ws.okx.com:8443/ws/v5/business"):
         self.ws = None
         self.connected = False
         self.reconnecting = False
         self.last_heartbeat = time.time()
         self.subscription_args = []
         self.market_api = None  # 不在这里初始化，使用时再创建
+        self.trading_data_api = None  # 添加TradingDataAPI
         self.last_api_call = 0  # 上次API调用时间
         self.api_request_count = 0  # API请求计数器
         self.api_request_reset_time = time.time()  # 重置计数器的时间
         self.session = None  # 添加session用于API请求
+        self.url = url  # WebSocket URL
+        self.heartbeat_task = None  # 添加心跳任务
+        self.last_ping_time = 0
+        self.ping_interval = 300  # 每20秒检查一次连接
+        self.ping_timeout = 10   # 等待pong超时时间
         
     def _get_session(self):
         """创建并配置requests session"""
@@ -90,30 +103,95 @@ class ConnectionManager:
     async def connect(self):
         """建立WebSocket连接"""
         try:
-            print("正在连接OKX WebSocket...")
-            self.ws = WsPublicAsync(url="wss://ws.okx.com:8443/ws/v5/business")
+            print(f"正在连接OKX WebSocket: {self.url}")
+            self.ws = WsPublicAsync(url=self.url)
             await self.ws.start()
             self.connected = True
             self.last_heartbeat = time.time()
-            print("OKX WebSocket连接成功")
+            self.last_ping_time = time.time()
+            
+            # 启动心跳任务
+            if self.heartbeat_task is None:
+                self.heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+            
+            print(f"OKX WebSocket连接成功: {self.url}")
             return True
         except Exception as e:
-            print(f"连接失败: {e}")
+            print(f"连接失败 {self.url}: {e}")
             traceback.print_exc()
             return False
     
     async def disconnect(self):
         """断开WebSocket连接"""
         try:
+            # 停止心跳任务
+            if self.heartbeat_task:
+                self.heartbeat_task.cancel()
+                try:
+                    await self.heartbeat_task
+                except asyncio.CancelledError:
+                    pass
+                self.heartbeat_task = None
+            
             if self.ws:
-                await self.ws.unsubscribe([], callback=lambda x: None)
+                # 首先取消订阅所有频道
+                try:
+                    if hasattr(self.ws, 'websocket') and self.ws.websocket:
+                        print(f"取消订阅所有频道: {self.url}")
+                        await self.ws.unsubscribe([], callback=lambda x: None)
+                except Exception as e:
+                    print(f"取消订阅时出错 {self.url}: {e}")
+                
+                # 关闭连接
+                try:
+                    if hasattr(self.ws, 'stop') and callable(self.ws.stop):
+                        print(f"关闭WebSocket连接: {self.url}")
+                        await self.ws.stop()
+                except Exception as e:
+                    print(f"关闭连接时出错 {self.url}: {e}")
+                
                 self.connected = False
-                print("WebSocket连接已断开")
+                print(f"WebSocket连接已断开: {self.url}")
         except Exception as e:
-            print(f"断开连接时出错: {e}")
+            print(f"断开连接时出错 {self.url}: {e}")
             traceback.print_exc()
         finally:
+            # 强制清理
             self.ws = None
+            self.connected = False
+    
+    async def _heartbeat_loop(self):
+        """心跳保活循环"""
+        print(f"启动心跳保活循环: {self.url}")
+        
+        while self.connected and running:
+            try:
+                current_time = time.time()
+                
+                # 检查是否需要发送ping
+                if current_time - self.last_ping_time >= self.ping_interval:
+                    # 检查连接是否仍然活跃
+                    if current_time - self.last_heartbeat > self.ping_interval + self.ping_timeout:
+                        print(f"心跳超时: {self.url}，最后心跳时间 {current_time - self.last_heartbeat:.1f}秒前")
+                        # 标记连接为断开，外层循环会重新连接
+                        self.connected = False
+                        break
+                    
+                    # 更新ping时间
+                    self.last_ping_time = current_time
+                    print(f"心跳检查: {self.url}，连接正常")
+                
+                await asyncio.sleep(5)  # 每5秒检查一次
+                
+            except asyncio.CancelledError:
+                print(f"心跳循环被取消: {self.url}")
+                break
+            except Exception as e:
+                print(f"心跳循环出错: {self.url}, 错误: {e}")
+                traceback.print_exc()
+                await asyncio.sleep(5)
+        
+        print(f"心跳保活循环结束: {self.url}")
     
     async def subscribe(self, args, callback):
         """订阅数据"""
@@ -123,10 +201,10 @@ class ConnectionManager:
             
             self.subscription_args = args
             await self.ws.subscribe(args, callback=callback)
-            print(f"订阅成功，共 {len(args)} 个产品")
+            print(f"订阅成功，共 {len(args)} 个产品, URL: {self.url}")
             return True
         except Exception as e:
-            print(f"订阅失败: {e}")
+            print(f"订阅失败 {self.url}: {e}")
             traceback.print_exc()
             return False
     
@@ -139,6 +217,12 @@ class ConnectionManager:
         if self.market_api is None:
             self.market_api = MarketData.MarketAPI(flag=flag, debug=False)
         return self.market_api
+    
+    def get_trading_data_api(self):
+        """获取TradingDataAPI实例（延迟创建）"""
+        if self.trading_data_api is None:
+            self.trading_data_api = TradingData_api.TradingDataAPI(flag=flag, debug=False)
+        return self.trading_data_api
     
     def get_ticker_data_with_rate_limit(self, inst_id):
         """带速率限制的获取ticker数据"""
@@ -177,7 +261,7 @@ class ConnectionManager:
                 error_msg = result.get("msg") if result else "No response"
                 
                 if error_code == "50011":  # Too Many Requests
-                    print(f"API频率限制触发，等待2秒...")
+                    print(f"API频率限制触发，等待2秒...",result)
                     time.sleep(2.1)
                     # 重试一次
                     return self.get_ticker_data_with_rate_limit(inst_id)
@@ -203,8 +287,11 @@ class ConnectionManager:
             print(f"获取 {inst_id} ticker数据时出错: {e}")
             return None
 
-# 创建连接管理器实例
-connection_manager = ConnectionManager()
+# 创建连接管理器实例 - K线数据
+connection_manager_kline = ConnectionManager(url="wss://ws.okx.com:8443/ws/v5/business")
+
+# 创建连接管理器实例 - 持仓量数据
+connection_manager_oi = ConnectionManager(url="wss://ws.okx.com:8443/ws/v5/public")
 
 def format_inst_id(inst_id):
     """格式化产品ID，去掉-USDT-SWAP后缀"""
@@ -274,10 +361,23 @@ def calculate_change_rate(open_price, close_price):
     except (ValueError, TypeError):
         return 0
 
+def calculate_oi_change_rate(current_oi, history_oi):
+    """计算持仓量变化百分比"""
+    try:
+        current_val = float(current_oi)
+        history_val = float(history_oi)
+        
+        if history_val == 0:
+            return 0
+        change_rate = ((current_val - history_val) / history_val) * 100
+        return round(change_rate, 2)
+    except (ValueError, TypeError):
+        return 0
+
 async def update_single_volume(inst_id, retry_count=0):
     """更新单个产品的24h成交量数据"""
     try:
-        ticker_data = connection_manager.get_ticker_data_with_rate_limit(inst_id)
+        ticker_data = connection_manager_kline.get_ticker_data_with_rate_limit(inst_id)
         if ticker_data:
             volume_24h = calculate_24h_volume_usdt(ticker_data)
             volume_24h_data[inst_id] = {
@@ -308,6 +408,104 @@ async def update_single_volume(inst_id, retry_count=0):
             return await update_single_volume(inst_id, retry_count + 1)
         return False
 
+async def update_oi_history(inst_id, retry_count=0):
+    """更新单个产品的历史持仓量数据"""
+    try:
+        # 确保API调用频率限制
+        current_time = time.time()
+        elapsed = current_time - connection_manager_kline.last_api_call
+        
+        if elapsed < API_RATE_LIMIT_DELAY:
+            await asyncio.sleep(API_RATE_LIMIT_DELAY - elapsed)
+        
+        # 计算1小时前的时间戳
+        current_timestamp = int(time.time() * 1000)  # 毫秒时间戳
+        one_hour_ago = current_timestamp - 3600 * 1000
+        
+        # 获取历史持仓量数据
+        trading_api = connection_manager_kline.get_trading_data_api()
+        result = trading_api.get_open_interest_history(
+            instId=inst_id,
+            period="1H",
+            begin=str(one_hour_ago),
+            limit="1"
+        )
+        
+        # 更新最后API调用时间
+        connection_manager_kline.last_api_call = time.time()
+        
+        if result and result.get("code") == "0" and result.get("data"):
+            history_data = result["data"]
+            if history_data and len(history_data) > 0:
+                # 获取最新的历史数据
+                latest_history = history_data[0]
+                if len(latest_history) >= 3:  # ts, oi, oiCcy, oiUsd
+                    oi_ccy = latest_history[2]  # oiCcy字段
+                    oi_history_data[inst_id] = {
+                        'oi_ccy': float(oi_ccy),
+                        'timestamp': time.time(),
+                        'period': '1H'
+                    }
+                    print(f"更新 {inst_id} 历史持仓量数据: {oi_ccy}")
+                    return True
+        else:
+            error_code = result.get("code") if result else "unknown"
+            error_msg = result.get("msg") if result else "No response"
+            print(f"获取 {inst_id} 历史持仓量失败: 代码={error_code}, 消息={error_msg},{result}")
+            
+            # 如果遇到频率限制，等待更长时间
+            if error_code == "50011":  # Too Many Requests
+                print(f"历史持仓量API频率限制触发，等待2秒...")
+                await asyncio.sleep(2.1)
+                # 重试一次
+                if retry_count < 2:
+                    return await update_oi_history(inst_id, retry_count + 1)
+            elif retry_count < 2:
+                await asyncio.sleep(1)
+                return await update_oi_history(inst_id, retry_count + 1)
+            
+            return False
+            
+    except Exception as e:
+        print(f"更新 {inst_id} 历史持仓量时出错: {e}")
+        traceback.print_exc()
+        if retry_count < 2:
+            await asyncio.sleep(1)
+            return await update_oi_history(inst_id, retry_count + 1)
+        return False
+
+async def batch_update_oi_history():
+    """批量更新所有产品的历史持仓量数据"""
+    global inst_ids
+    
+    if not inst_ids:
+        print("没有产品需要更新历史持仓量数据")
+        return
+    
+    print(f"开始批量更新 {len(inst_ids)} 个产品的历史持仓量...")
+    
+    success_count = 0
+    fail_count = 0
+    
+    for inst_id in inst_ids:
+        # 检查是否需要更新（每小时更新一次）
+        if inst_id in oi_last_update:
+            if time.time() - oi_last_update[inst_id] < 3600:  # 1小时内已更新
+                continue
+            
+        result = await update_oi_history(inst_id)
+        if result:
+            success_count += 1
+            oi_last_update[inst_id] = time.time()
+        else:
+            fail_count += 1
+        
+        # 等待0.3秒后更新下一个产品
+        await asyncio.sleep(API_RATE_LIMIT_DELAY)
+    
+    print(f"历史持仓量批量更新完成: 成功 {success_count}, 失败 {fail_count}")
+    return success_count
+
 async def continuous_volume_updater():
     """连续更新24h成交量数据 - 每0.3秒更新一个产品"""
     global volume_update_queue, volume_update_in_progress, inst_ids
@@ -317,7 +515,7 @@ async def continuous_volume_updater():
     # 初始化队列
     volume_update_queue = deque(inst_ids)
     
-    while running and connection_manager.is_connected():
+    while running and connection_manager_kline.is_connected():
         try:
             if not volume_update_queue:
                 # 重新填充队列
@@ -429,6 +627,18 @@ class MemoryOptimizedDataStore:
             # 获取24h成交量数据（如果存在）
             volume_24h_info = volume_24h_data.get(key, {})
             
+            # 获取持仓量数据
+            oi_info = oi_data.get(key, {})
+            oi_history_info = oi_history_data.get(key, {})
+            
+            # 计算持仓量变化百分比
+            oi_change_rate = 0
+            if 'oi_ccy' in oi_info and 'oi_ccy' in oi_history_info:
+                oi_change_rate = calculate_oi_change_rate(
+                    oi_info['oi_ccy'], 
+                    oi_history_info['oi_ccy']
+                )
+            
             # 检查数据新鲜度
             volume_freshness = 0  # 0: 无数据, 1: 新鲜(5分钟内), -1: 过期
             if key in volume_last_update:
@@ -458,6 +668,12 @@ class MemoryOptimizedDataStore:
                 'volume_24h': volume_24h_info.get('volume_24h', existing.get('volume_24h', 0)),
                 'volume_24h_formatted': volume_24h_info.get('volume_24h_formatted', existing.get('volume_24h_formatted', '--')),
                 'volume_freshness': volume_freshness,
+                'oi_ccy': oi_info.get('oi_ccy', existing.get('oi_ccy', 0)),
+                'oi_ccy_formatted': format_volume_cn(oi_info.get('oi_ccy', 0)),
+                'oi_history_ccy': oi_history_info.get('oi_ccy', existing.get('oi_history_ccy', 0)),
+                'oi_history_ccy_formatted': format_volume_cn(oi_history_info.get('oi_ccy', 0)),
+                'oi_change_rate': oi_change_rate,
+                'oi_last_update': oi_info.get('timestamp', existing.get('oi_last_update', 0)),
                 'timestamp': value.get('timestamp', existing.get('timestamp', time.time())),
                 'last_update': time.time()
             }
@@ -488,9 +704,11 @@ async def broadcast_connection_status():
     
     status_msg = json.dumps({
         'type': 'okx_connection_status',
-        'status': 'connected' if connection_manager.is_connected() else 'disconnected',
+        'status': 'connected' if connection_manager_kline.is_connected() else 'disconnected',
+        'oi_status': 'connected' if connection_manager_oi.is_connected() else 'disconnected',
         'timestamp': datetime.now().isoformat(),
-        'reconnect_count': reconnect_attempts
+        'reconnect_count': reconnect_attempts,
+        'oi_reconnect_count': oi_reconnect_attempts
     })
     
     disconnected_clients = []
@@ -503,10 +721,10 @@ async def broadcast_connection_status():
     for ws in disconnected_clients:
         clients.discard(ws)
 
-async def okx_websocket_handler():
+async def okx_kline_handler():
     global main_event_loop, total_products, inst_ids, reconnect_attempts, ws_connection_active
     
-    print("OKX WebSocket处理器启动...")
+    print("OKX K线WebSocket处理器启动...")
     
     main_pairs = [
         "BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP", 
@@ -517,8 +735,11 @@ async def okx_websocket_handler():
         "ETC-USDT-SWAP", "XLM-USDT-SWAP", "ALGO-USDT-SWAP"
     ]
     
-    def callback(message):
+    def kline_callback(message):
         try:
+            # 更新心跳时间
+            connection_manager_kline.last_heartbeat = time.time()
+            
             if isinstance(message, str):
                 data = json.loads(message)
             else:
@@ -528,53 +749,61 @@ async def okx_websocket_handler():
                 return
             
             if "data" in data and "arg" in data:
-                inst_id = data["arg"]["instId"]
-                kline_data = data["data"]
-                
-                if kline_data and len(kline_data) > 0:
-                    latest_kline = kline_data[0]
+                arg_data = data["arg"]
+                if "channel" in arg_data and arg_data["channel"] == "candle1H":
+                    inst_id = arg_data["instId"]
+                    kline_data = data["data"]
                     
-                    if len(latest_kline) >= 8:  # 确保有足够的字段
-                        open_price = latest_kline[1]
-                        close_price = latest_kline[4]
-                        volume_1h = float(latest_kline[7]) if latest_kline[7] else 0  # volCcyQuote字段
+                    if kline_data and len(kline_data) > 0:
+                        latest_kline = kline_data[0]
                         
-                        change_rate = calculate_change_rate(open_price, close_price)
-                        
-                        # 1小时成交量也使用中文单位格式化
-                        volume_1h_formatted = format_volume_cn(volume_1h)
-                        
-                        price_store.update(inst_id, {
-                            'change_rate': change_rate,
-                            'open_price': float(open_price),
-                            'close_price': float(close_price),
-                            'volume_1h': volume_1h,
-                            'volume_1h_formatted': volume_1h_formatted,
-                            'timestamp': time.time()
-                        })
-                        
-                        last_received_time[inst_id] = time.time()
-                        
-                        try:
-                            if main_event_loop and main_event_loop.is_running():
-                                if broadcast_queue.qsize() < 50:
-                                    asyncio.run_coroutine_threadsafe(
-                                        broadcast_queue.put({
-                                            'type': 'data_update',
-                                            'inst_id': inst_id
-                                        }),
-                                        main_event_loop
-                                    )
-                        except:
-                            pass
+                        if len(latest_kline) >= 8:  # 确保有足够的字段
+                            open_price = latest_kline[1]
+                            close_price = latest_kline[4]
+                            volume_1h = float(latest_kline[7]) if latest_kline[7] else 0  # volCcyQuote字段
+                            
+                            change_rate = calculate_change_rate(open_price, close_price)
+                            
+                            # 1小时成交量也使用中文单位格式化
+                            volume_1h_formatted = format_volume_cn(volume_1h)
+                            
+                            price_store.update(inst_id, {
+                                'change_rate': change_rate,
+                                'open_price': float(open_price),
+                                'close_price': float(close_price),
+                                'volume_1h': volume_1h,
+                                'volume_1h_formatted': volume_1h_formatted,
+                                'timestamp': time.time()
+                            })
+                            
+                            last_received_time[inst_id] = time.time()
+                            
+                            try:
+                                if main_event_loop and main_event_loop.is_running():
+                                    if broadcast_queue.qsize() < 50:
+                                        asyncio.run_coroutine_threadsafe(
+                                            broadcast_queue.put({
+                                                'type': 'data_update',
+                                                'inst_id': inst_id
+                                            }),
+                                            main_event_loop
+                                        )
+                            except:
+                                pass
         
         except Exception as e:
-            print(f"处理消息时出错: {e}")
+            print(f"处理K线消息时出错: {e}")
     
     async def connect_and_subscribe():
         global reconnect_attempts, inst_ids, total_products, ws_connection_active
         
         try:
+            # 确保之前的连接已断开
+            await connection_manager_kline.disconnect()
+            
+            # 等待一小段时间
+            await asyncio.sleep(1)
+            
             marketDataAPI = MarketData.MarketAPI(flag=flag, debug=False)
             result = marketDataAPI.get_tickers(instType="SWAP")
             
@@ -599,7 +828,7 @@ async def okx_websocket_handler():
         total_products = len(inst_ids)
         print(f"选择监控 {total_products} 个产品")
         
-        if await connection_manager.connect():
+        if await connection_manager_kline.connect():
             ws_connection_active = True
             
             # 启动连续成交量更新任务
@@ -609,18 +838,26 @@ async def okx_websocket_handler():
                     main_event_loop
                 )
             
-            batch_size = 10
-            for i in range(0, len(inst_ids), batch_size):
-                batch = inst_ids[i:i+batch_size]
+            # 初始更新历史持仓量数据
+            if main_event_loop and main_event_loop.is_running():
+                asyncio.run_coroutine_threadsafe(
+                    batch_update_oi_history(),
+                    main_event_loop
+                )
+            
+            # 分批订阅K线数据
+            kline_batch_size = 10
+            for i in range(0, len(inst_ids), kline_batch_size):
+                batch = inst_ids[i:i+kline_batch_size]
                 args = [{"channel": "candle1H", "instId": inst_id} for inst_id in batch]
                 
-                if await connection_manager.subscribe(args, callback):
+                if await connection_manager_kline.subscribe(args, kline_callback):
                     await asyncio.sleep(0.5)
                 else:
-                    print(f"批次 {i//batch_size + 1} 订阅失败")
+                    print(f"K线批次 {i//kline_batch_size + 1} 订阅失败")
                     break
             
-            print("订阅完成，等待初始数据...")
+            print("K线订阅完成，等待初始数据...")
             await asyncio.sleep(3)
             
             initial_received = price_store.count()
@@ -637,50 +874,306 @@ async def okx_websocket_handler():
     
     while running:
         try:
-            print("正在建立OKX WebSocket连接...")
+            print("正在建立OKX K线WebSocket连接...")
             if await connect_and_subscribe():
-                print("OKX WebSocket连接成功")
+                print("OKX K线WebSocket连接成功")
                 
                 last_data_time = time.time()
-                while running and connection_manager.is_connected():
+                last_oi_history_update = time.time()
+                last_oi_check_time = time.time()
+                
+                while running and connection_manager_kline.is_connected():
                     await asyncio.sleep(1)
                     
                     current_time = time.time()
-                    if current_time - last_data_time > 60:
-                        print("长时间没有收到数据，可能连接已断开")
+                    
+                    # 检查心跳是否超时
+                    if current_time - connection_manager_kline.last_heartbeat > 60:
+                        print(f"心跳超时，最后心跳时间 {current_time - connection_manager_kline.last_heartbeat:.1f}秒前，重新连接")
                         break
+                    
+                    if current_time - last_data_time > 90:
+                        print("长时间没有收到K线数据，可能连接已断开")
+                        break
+                    
+                    # 每小时更新一次历史持仓量数据
+                    if current_time - last_oi_check_time >= 60:  # 每60秒检查一次
+                        current_minute = datetime.now().minute
+                        # 如果是整点后的1-2分钟，并且距离上次更新超过1小时，则更新
+                        if (current_minute in [1, 2]) and (current_time - last_oi_history_update >= 3600):
+                            print(f"整点后{current_minute}分钟，开始更新历史持仓量数据...")
+                            asyncio.run_coroutine_threadsafe(
+                                batch_update_oi_history(),
+                                main_event_loop
+                            )
+                            last_oi_history_update = current_time
+                        last_oi_check_time = current_time
                     
                     if price_store.count() > 0:
                         last_data_time = current_time
                 
-                print("OKX WebSocket连接断开")
+                print("OKX K线WebSocket连接断开")
                 ws_connection_active = False
                 
                 if main_event_loop and main_event_loop.is_running():
                     asyncio.run_coroutine_threadsafe(broadcast_connection_status(), main_event_loop)
             
-            await connection_manager.disconnect()
+            await connection_manager_kline.disconnect()
             
             if running:
                 reconnect_attempts += 1
                 wait_time = min(RECONNECT_DELAY * reconnect_attempts, 60)
-                print(f"等待 {wait_time} 秒后重连... (尝试次数: {reconnect_attempts})")
+                print(f"等待 {wait_time} 秒后重连K线... (尝试次数: {reconnect_attempts})")
                 await asyncio.sleep(wait_time)
                 
                 if reconnect_attempts >= MAX_RECONNECT_ATTEMPTS:
-                    print(f"达到最大重连尝试次数 {MAX_RECONNECT_ATTEMPTS}")
-                    break
+                    print(f"达到最大K线重连尝试次数 {MAX_RECONNECT_ATTEMPTS}")
+                    # 重置重连计数，继续尝试
+                    reconnect_attempts = 0
+                    wait_time = RECONNECT_DELAY
         
         except asyncio.CancelledError:
-            print("WebSocket任务被取消")
+            print("K线WebSocket任务被取消")
             break
         except Exception as e:
-            print(f"WebSocket处理错误: {e}")
+            print(f"K线WebSocket处理错误: {e}")
             traceback.print_exc()
             if running:
                 await asyncio.sleep(RECONNECT_DELAY)
     
-    print("OKX WebSocket处理器停止")
+    print("OKX K线WebSocket处理器停止")
+
+async def okx_oi_handler():
+    global ws_oi_connection_active, oi_reconnect_attempts
+    
+    print("OKX 持仓量WebSocket处理器启动...")
+    
+    def oi_callback(message):
+        try:
+            # 更新心跳时间
+            connection_manager_oi.last_heartbeat = time.time()
+            
+            if isinstance(message, str):
+                data = json.loads(message)
+            else:
+                data = message
+            
+            if "event" in data and data["event"] == "subscribe":
+                return
+            
+            if "data" in data and "arg" in data:
+                arg_data = data["arg"]
+                if "channel" in arg_data and arg_data["channel"] == "open-interest":
+                    oi_data_list = data["data"]
+                    
+                    if oi_data_list and len(oi_data_list) > 0:
+                        for item in oi_data_list:
+                            inst_id = item.get("instId")
+                            if inst_id and inst_id in inst_ids:  # 只处理我们监控的产品
+                                # 更新实时持仓量数据
+                                oi_ccy = float(item.get("oiCcy", 0))
+                                oi_data[inst_id] = {
+                                    'oi_ccy': oi_ccy,
+                                    'timestamp': time.time()
+                                }
+                                
+                                # 如果有历史数据，计算变化率
+                                if inst_id in oi_history_data:
+                                    history_oi = oi_history_data[inst_id].get('oi_ccy', 0)
+                                    if history_oi > 0:
+                                        oi_change_rate = calculate_oi_change_rate(oi_ccy, history_oi)
+                                        
+                                        # 更新数据存储
+                                        price_store.update(inst_id, {
+                                            'oi_ccy': oi_ccy,
+                                            'oi_change_rate': oi_change_rate
+                                        })
+                                        
+                                        # 触发广播更新
+                                        try:
+                                            if main_event_loop and main_event_loop.is_running():
+                                                if broadcast_queue.qsize() < 50:
+                                                    asyncio.run_coroutine_threadsafe(
+                                                        broadcast_queue.put({
+                                                            'type': 'data_update',
+                                                            'inst_id': inst_id
+                                                        }),
+                                                        main_event_loop
+                                                    )
+                                        except:
+                                            pass
+        
+        except Exception as e:
+            print(f"处理持仓量消息时出错: {e}")
+    
+    async def connect_and_subscribe_oi():
+        global ws_oi_connection_active, oi_reconnect_attempts
+        
+        if not inst_ids:
+            print("等待产品列表获取...")
+            await asyncio.sleep(5)
+            return False
+        
+        print(f"开始订阅 {len(inst_ids)} 个产品的持仓量数据...")
+        
+        if await connection_manager_oi.connect():
+            ws_oi_connection_active = True
+            
+            # 分批订阅持仓量数据
+            oi_batch_size = 5
+            for i in range(0, len(inst_ids), oi_batch_size):
+                batch = inst_ids[i:i+oi_batch_size]
+                args = [{"channel": "open-interest", "instId": inst_id} for inst_id in batch]
+                
+                if await connection_manager_oi.subscribe(args, oi_callback):
+                    await asyncio.sleep(0.5)
+                else:
+                    print(f"持仓量批次 {i//oi_batch_size + 1} 订阅失败")
+                    break
+            
+            print("持仓量订阅完成")
+            
+            if main_event_loop and main_event_loop.is_running():
+                asyncio.run_coroutine_threadsafe(broadcast_connection_status(), main_event_loop)
+            
+            oi_reconnect_attempts = 0
+            return True
+        else:
+            return False
+    
+    while running:
+        try:
+            print("正在建立OKX 持仓量WebSocket连接...")
+            if await connect_and_subscribe_oi():
+                print("OKX 持仓量WebSocket连接成功")
+                
+                last_oi_data_time = time.time()
+                
+                while running and connection_manager_oi.is_connected():
+                    await asyncio.sleep(1)
+                    
+                    current_time = time.time()
+                    
+                    # 检查心跳是否超时
+                    if current_time - connection_manager_oi.last_heartbeat > 90:
+                        print(f"持仓量心跳超时，最后心跳时间 {current_time - connection_manager_oi.last_heartbeat:.1f}秒前，重新连接")
+                        break
+                    
+                    if current_time - last_oi_data_time > 120:  # 持仓量更新较慢，延长判断时间
+                        print("长时间没有收到持仓量数据，可能连接已断开")
+                        break
+                    
+                    # 更新最后数据时间
+                    if oi_data:
+                        last_oi_data_time = current_time
+                
+                print("OKX 持仓量WebSocket连接断开")
+                ws_oi_connection_active = False
+                
+                if main_event_loop and main_event_loop.is_running():
+                    asyncio.run_coroutine_threadsafe(broadcast_connection_status(), main_event_loop)
+            
+            await connection_manager_oi.disconnect()
+            
+            if running:
+                oi_reconnect_attempts += 1
+                wait_time = min(RECONNECT_DELAY * oi_reconnect_attempts, 60)
+                print(f"等待 {wait_time} 秒后重连持仓量... (尝试次数: {oi_reconnect_attempts})")
+                await asyncio.sleep(wait_time)
+                
+                if oi_reconnect_attempts >= MAX_RECONNECT_ATTEMPTS:
+                    print(f"达到最大持仓量重连尝试次数 {MAX_RECONNECT_ATTEMPTS}")
+                    # 重置重连计数，继续尝试
+                    oi_reconnect_attempts = 0
+                    wait_time = RECONNECT_DELAY
+        
+        except asyncio.CancelledError:
+            print("持仓量WebSocket任务被取消")
+            break
+        except Exception as e:
+            print(f"持仓量WebSocket处理错误: {e}")
+            traceback.print_exc()
+            if running:
+                await asyncio.sleep(RECONNECT_DELAY)
+    
+    print("OKX 持仓量WebSocket处理器停止")
+
+async def restart_websocket_connections():
+    """重启所有WebSocket连接"""
+    global reconnect_attempts, oi_reconnect_attempts
+    
+    print("正在重启所有WebSocket连接...")
+    
+    # 重置重连计数器
+    reconnect_attempts = 0
+    oi_reconnect_attempts = 0
+    
+    # 关闭现有连接
+    await connection_manager_kline.disconnect()
+    await connection_manager_oi.disconnect()
+    
+    # 清空订阅列表
+    connection_manager_kline.subscription_args = []
+    connection_manager_oi.subscription_args = []
+    
+    # 清空数据缓存
+    price_store.clear()
+    volume_24h_data.clear()
+    volume_last_update.clear()
+    oi_data.clear()
+    oi_history_data.clear()
+    oi_last_update.clear()
+    
+    print("WebSocket连接重启完成")
+    
+    # 通知前端
+    if main_event_loop and main_event_loop.is_running():
+        asyncio.run_coroutine_threadsafe(broadcast_connection_status(), main_event_loop)
+
+async def okx_websocket_handler():
+    """主WebSocket处理器，同时运行K线和持仓量处理器"""
+    print("启动OKX WebSocket总处理器...")
+    
+    kline_task = None
+    oi_task = None
+    
+    try:
+        # 同时运行K线处理器和持仓量处理器
+        kline_task = asyncio.create_task(okx_kline_handler())
+        oi_task = asyncio.create_task(okx_oi_handler())
+        
+        # 等待两个任务完成（如果其中一个结束，另一个也会被取消）
+        await asyncio.gather(kline_task, oi_task, return_exceptions=True)
+    except asyncio.CancelledError:
+        print("WebSocket总处理器被取消")
+        
+        # 确保所有任务都被取消
+        if kline_task:
+            kline_task.cancel()
+        if oi_task:
+            oi_task.cancel()
+            
+        # 等待任务取消完成
+        try:
+            if kline_task:
+                await kline_task
+            if oi_task:
+                await oi_task
+        except asyncio.CancelledError:
+            pass
+    except Exception as e:
+        print(f"WebSocket总处理器错误: {e}")
+        traceback.print_exc()
+    finally:
+        # 确保连接被关闭
+        print("正在关闭WebSocket连接...")
+        try:
+            await connection_manager_kline.disconnect()
+            await connection_manager_oi.disconnect()
+        except Exception as e:
+            print(f"关闭连接时出错: {e}")
+        
+        print("OKX WebSocket总处理器停止")
 
 def get_statistics():
     try:
@@ -693,7 +1186,8 @@ def get_statistics():
                 'collected': 0,
                 'avg_change': 0,
                 'up_count': 0,
-                'down_count': 0
+                'down_count': 0,
+                'avg_oi_change': 0
             }
         
         changes = [item['change_rate'] for item in data.values()]
@@ -701,12 +1195,17 @@ def get_statistics():
         up_count = len([c for c in changes if c > 0])
         down_count = len([c for c in changes if c < 0])
         
+        # 计算持仓量平均变化率
+        oi_changes = [item.get('oi_change_rate', 0) for item in data.values() if item.get('oi_change_rate') is not None]
+        avg_oi_change = sum(oi_changes) / len(oi_changes) if oi_changes else 0
+        
         return {
             'total': total_products,
             'collected': collected,
             'avg_change': avg_change,
             'up_count': up_count,
-            'down_count': down_count
+            'down_count': down_count,
+            'avg_oi_change': avg_oi_change
         }
     except:
         return {
@@ -714,7 +1213,8 @@ def get_statistics():
             'collected': 0,
             'avg_change': 0,
             'up_count': 0,
-            'down_count': 0
+            'down_count': 0,
+            'avg_oi_change': 0
         }
 
 def get_table_data():
@@ -737,6 +1237,10 @@ def get_table_data():
                     'volume_1h': item.get('volume_1h', 0),
                     'volume_1h_formatted': item.get('volume_1h_formatted', '--'),
                     'volume_freshness': item.get('volume_freshness', 0),
+                    'oi_ccy': item.get('oi_ccy', 0),
+                    'oi_ccy_formatted': item.get('oi_ccy_formatted', '--'),
+                    'oi_change_rate': item.get('oi_change_rate', 0),
+                    'oi_history_ccy_formatted': item.get('oi_history_ccy_formatted', '--'),
                     'timestamp': datetime.fromtimestamp(item['timestamp']).strftime("%H:%M:%S")
                 })
         
@@ -753,6 +1257,10 @@ def get_table_data():
                     'volume_1h': item.get('volume_1h', 0),
                     'volume_1h_formatted': item.get('volume_1h_formatted', '--'),
                     'volume_freshness': item.get('volume_freshness', 0),
+                    'oi_ccy': item.get('oi_ccy', 0),
+                    'oi_ccy_formatted': item.get('oi_ccy_formatted', '--'),
+                    'oi_change_rate': item.get('oi_change_rate', 0),
+                    'oi_history_ccy_formatted': item.get('oi_history_ccy_formatted', '--'),
                     'timestamp': datetime.fromtimestamp(item['timestamp']).strftime("%H:%M:%S")
                 })
         
@@ -782,7 +1290,9 @@ def get_memory_stats():
             'collected_data': price_store.count(),
             'subscribed': total_products,
             'clients': len(clients),
-            'volume_cache': len(volume_24h_data)
+            'volume_cache': len(volume_24h_data),
+            'oi_cache': len(oi_data),
+            'oi_history_cache': len(oi_history_data)
         }
     except:
         return {
@@ -791,7 +1301,9 @@ def get_memory_stats():
             'collected_data': price_store.count(),
             'subscribed': total_products,
             'clients': len(clients),
-            'volume_cache': len(volume_24h_data)
+            'volume_cache': len(volume_24h_data),
+            'oi_cache': len(oi_data),
+            'oi_history_cache': len(oi_history_data)
         }
 
 async def broadcast_worker():
@@ -879,9 +1391,11 @@ async def websocket_handler(request):
         
         await ws.send_str(json.dumps({
             'type': 'okx_connection_status',
-            'status': 'connected' if connection_manager.is_connected() else 'disconnected',
+            'status': 'connected' if connection_manager_kline.is_connected() else 'disconnected',
+            'oi_status': 'connected' if connection_manager_oi.is_connected() else 'disconnected',
             'timestamp': datetime.now().isoformat(),
-            'reconnect_count': reconnect_attempts
+            'reconnect_count': reconnect_attempts,
+            'oi_reconnect_count': oi_reconnect_attempts
         }))
         
         await broadcast_volume_stats()
@@ -910,6 +1424,9 @@ async def websocket_handler(request):
                             last_received_time.clear()
                             volume_24h_data.clear()
                             volume_last_update.clear()
+                            oi_data.clear()
+                            oi_history_data.clear()
+                            oi_last_update.clear()
                             await ws.send_str(json.dumps({
                                 'type': 'command_response',
                                 'success': True,
@@ -933,6 +1450,30 @@ async def websocket_handler(request):
                             if main_event_loop and main_event_loop.is_running():
                                 asyncio.run_coroutine_threadsafe(
                                     batch_update_volumes(),
+                                    main_event_loop
+                                )
+                        
+                        elif command == 'update_oi_history':
+                            await ws.send_str(json.dumps({
+                                'type': 'command_response',
+                                'success': True,
+                                'message': '开始强制更新所有产品的历史持仓量数据...'
+                            }))
+                            if main_event_loop and main_event_loop.is_running():
+                                asyncio.run_coroutine_threadsafe(
+                                    batch_update_oi_history(),
+                                    main_event_loop
+                                )
+                        
+                        elif command == 'restart':
+                            await ws.send_str(json.dumps({
+                                'type': 'command_response',
+                                'success': True,
+                                'message': '正在重启WebSocket连接...'
+                            }))
+                            if main_event_loop and main_event_loop.is_running():
+                                asyncio.run_coroutine_threadsafe(
+                                    restart_websocket_connections(),
                                     main_event_loop
                                 )
                     
@@ -1076,14 +1617,28 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             content: "↕";
             color: #ccc;
         }
+        .oi-change-positive {
+            color: var(--success);
+            font-weight: bold;
+        }
+        .oi-change-negative {
+            color: var(--danger);
+            font-weight: bold;
+        }
+        .oi-change-neutral {
+            color: var(--gray);
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
             <div style="display: flex; justify-content: space-between; align-items: center;">
-                <h2 style="margin: 0; font-size: 18px;">📈 OKX SWAP 监控 (稳定版)</h2>
-                <div class="connection-status" id="okx-connection-status">连接中...</div>
+                <h2 style="margin: 0; font-size: 18px;">📈 OKX SWAP 监控 (持仓量版)</h2>
+                <div>
+                    <span class="connection-status" id="okx-kline-status">K线连接中...</span>
+                    <span class="connection-status" id="okx-oi-status" style="margin-left: 10px;">持仓量连接中...</span>
+                </div>
             </div>
             <div class="update-time">
                 最后更新: <span id="last-update">--:--:--</span>
@@ -1099,8 +1654,9 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             <div style="display: flex; gap: 15px; font-size: 13px;">
                 <span>产品: <span id="total-count">0</span>/<span id="total-products">0</span></span>
                 <span>内存: <span id="memory-usage">-- MB</span></span>
-                <span>重连次数: <span id="reconnect-count">0</span></span>
+                <span>重连次数: <span id="reconnect-count">0</span>(K线)/<span id="oi-reconnect-count">0</span>(持仓量)</span>
                 <span>24h成交量更新: <span id="volume-updated">0</span>/<span id="volume-total">0</span></span>
+                <span>持仓量变化: <span id="avg-oi-change">0.00%</span></span>
             </div>
         </div>
         
@@ -1116,6 +1672,10 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             <div class="stat-card">
                 <div style="font-size: 13px; color: var(--gray);">下跌产品</div>
                 <div class="stat-value negative" id="down-count">0</div>
+            </div>
+            <div class="stat-card">
+                <div style="font-size: 13px; color: var(--gray);">平均持仓量变化</div>
+                <div class="stat-value" id="avg-oi-change-value">0.00%</div>
             </div>
         </div>
         
@@ -1137,11 +1697,12 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                                 <th>价格</th>
                                 <th class="sortable-header sort-none" data-sort="volume24h" data-table="gainers">24h成交量<div class="sort-indicator"></div></th>
                                 <th class="sortable-header sort-none" data-sort="volume1h" data-table="gainers">1h成交量<div class="sort-indicator"></div></th>
+                                <th class="sortable-header sort-none" data-sort="oiChange" data-table="gainers">持仓量变化<div class="sort-indicator"></div></th>
                                 <th>时间</th>
                             </tr>
                         </thead>
                         <tbody id="gainers-body">
-                            <tr><td colspan="7" class="loading">加载中...</td></tr>
+                            <tr><td colspan="8" class="loading">加载中...</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -1164,11 +1725,12 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                                 <th>价格</th>
                                 <th class="sortable-header sort-none" data-sort="volume24h" data-table="losers">24h成交量<div class="sort-indicator"></div></th>
                                 <th class="sortable-header sort-none" data-sort="volume1h" data-table="losers">1h成交量<div class="sort-indicator"></div></th>
+                                <th class="sortable-header sort-none" data-sort="oiChange" data-table="losers">持仓量变化<div class="sort-indicator"></div></th>
                                 <th>时间</th>
                             </tr>
                         </thead>
                         <tbody id="losers-body">
-                            <tr><td colspan="7" class="loading">加载中...</td></tr>
+                            <tr><td colspan="8" class="loading">加载中...</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -1180,9 +1742,11 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             <button class="btn-stop" onclick="sendCommand('stop')">停止</button>
             <button onclick="sendCommand('clear')" style="background: var(--warning); color: white;">清空</button>
             <button onclick="sendCommand('reconnect')" style="background: var(--primary); color: white;">重连</button>
+            <button onclick="sendCommand('restart')" style="background: var(--primary); color: white;">重启连接</button>
             <button onclick="location.reload()" style="background: var(--gray); color: white;">刷新</button>
             <button onclick="toggleMemoryMonitor()" style="background: var(--primary); color: white;">内存监控</button>
             <button onclick="sendCommand('update_volumes')" style="background: var(--success); color: white;">强制更新成交量</button>
+            <button onclick="sendCommand('update_oi_history')" style="background: var(--success); color: white;">更新持仓量历史</button>
             <button onclick="resetAllSorting()" style="background: var(--warning); color: white;">重置排序</button>
             <div style="flex-grow: 1;"></div>
             <div style="font-size: 12px; color: var(--gray);">
@@ -1211,7 +1775,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         // 排序状态 - 修复排序逻辑
         let sortStates = {
             gainers: {
-                currentSort: null,  // null: 无排序, volume24h: 按24h成交量, volume1h: 按1h成交量
+                currentSort: null,  // null: 无排序, volume24h: 按24h成交量, volume1h: 按1h成交量, oiChange: 按持仓量变化
                 sortDirection: 'none', // 'none': 无排序, 'asc': 升序, 'desc': 降序
                 data: [],
                 originalOrder: []    // 原始涨跌幅排序顺序
@@ -1231,11 +1795,22 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             avgRenderTime: 0
         };
         
-        function updateOKXConnectionStatus(status) {
-            const element = document.getElementById('okx-connection-status');
-            element.textContent = status === 'connected' ? 'OKX已连接' : 
-                                 status === 'connecting' ? '连接中...' : '连接断开';
-            element.className = 'connection-status ' + status;
+        function updateOKXConnectionStatus(data) {
+            const klineElement = document.getElementById('okx-kline-status');
+            const oiElement = document.getElementById('okx-oi-status');
+            
+            klineElement.textContent = data.status === 'connected' ? 'K线已连接' : 'K线断开';
+            klineElement.className = 'connection-status ' + data.status;
+            
+            oiElement.textContent = data.oi_status === 'connected' ? '持仓量已连接' : '持仓量断开';
+            oiElement.className = 'connection-status ' + data.oi_status;
+            
+            if (data.reconnect_count !== undefined) {
+                document.getElementById('reconnect-count').textContent = data.reconnect_count;
+            }
+            if (data.oi_reconnect_count !== undefined) {
+                document.getElementById('oi-reconnect-count').textContent = data.oi_reconnect_count;
+            }
         }
         
         function initWebSocket() {
@@ -1279,10 +1854,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                             showNotification(data.message, data.success ? 'success' : 'error');
                             break;
                         case 'okx_connection_status':
-                            updateOKXConnectionStatus(data.status);
-                            if (data.reconnect_count !== undefined) {
-                                document.getElementById('reconnect-count').textContent = data.reconnect_count;
-                            }
+                            updateOKXConnectionStatus(data);
                             break;
                         case 'volume_update_stats':
                             updateVolumeStats(data);
@@ -1384,6 +1956,15 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             
             document.getElementById('up-count').textContent = stats.up_count || 0;
             document.getElementById('down-count').textContent = stats.down_count || 0;
+            
+            // 更新平均持仓量变化
+            const avgOiChangeElement = document.getElementById('avg-oi-change-value');
+            const avgOiChange = stats.avg_oi_change || 0;
+            avgOiChangeElement.textContent = avgOiChange.toFixed(2) + '%';
+            avgOiChangeElement.className = 'stat-value ' + (avgOiChange >= 0 ? 'positive' : 'negative');
+            
+            // 更新状态栏中的持仓量变化
+            document.getElementById('avg-oi-change').textContent = avgOiChange.toFixed(2) + '%';
         }
         
         function updateVolumeStats(data) {
@@ -1426,8 +2007,20 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             
             // 对数据进行排序，-1表示没有数据，始终排在末尾
             return [...data].sort((a, b) => {
-                const aValue = parseVolumeValue(a[sortKey === 'volume24h' ? 'volume_24h_formatted' : 'volume_1h_formatted']);
-                const bValue = parseVolumeValue(b[sortKey === 'volume24h' ? 'volume_24h_formatted' : 'volume_1h_formatted']);
+                let aValue, bValue;
+                
+                if (sortKey === 'volume24h') {
+                    aValue = parseVolumeValue(a.volume_24h_formatted);
+                    bValue = parseVolumeValue(b.volume_24h_formatted);
+                } else if (sortKey === 'volume1h') {
+                    aValue = parseVolumeValue(a.volume_1h_formatted);
+                    bValue = parseVolumeValue(b.volume_1h_formatted);
+                } else if (sortKey === 'oiChange') {
+                    aValue = a.oi_change_rate || 0;
+                    bValue = b.oi_change_rate || 0;
+                } else {
+                    return 0; // 不排序
+                }
                 
                 // 如果两个都没有数据，保持原顺序
                 if (aValue === -1 && bValue === -1) return 0;
@@ -1500,7 +2093,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             if (!tbody) return;
             
             if (data.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="7" class="loading">暂无数据</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="8" class="loading">暂无数据</td></tr>';
                 return;
             }
             
@@ -1511,6 +2104,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 const row = document.createElement('tr');
                 const isPositive = (item.change_rate || 0) >= 0;
                 const volumeFreshness = item.volume_freshness || 0;
+                const oiChange = item.oi_change_rate || 0;
                 
                 // 生成OKX交易链接
                 const instId = item.inst_id || '';
@@ -1531,6 +2125,16 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                     volume24hTitle = '24h成交量数据已过期';
                 }
                 
+                // 持仓量变化样式
+                let oiChangeClass = 'oi-change-neutral';
+                let oiChangeSign = '';
+                if (oiChange > 0) {
+                    oiChangeClass = 'oi-change-positive';
+                    oiChangeSign = '+';
+                } else if (oiChange < 0) {
+                    oiChangeClass = 'oi-change-negative';
+                }
+                
                 row.innerHTML = `
                     <td>${index + 1}</td>
                     <td>
@@ -1542,6 +2146,9 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                     <td>${formatNumber(item.close_price || 0)}</td>
                     <td class="${volume24hClass}" title="${volume24hTitle}">${item.volume_24h_formatted || '--'}</td>
                     <td class="volume-cell">${item.volume_1h_formatted || '--'}</td>
+                    <td class="${oiChangeClass}" title="实时: ${item.oi_ccy_formatted || '--'}, 1小时前: ${item.oi_history_ccy_formatted || '--'}">
+                        ${oiChangeSign}${(oiChange || 0).toFixed(2)}%
+                    </td>
                     <td>${item.timestamp || '--:--:--'}</td>
                 `;
                 
@@ -1643,7 +2250,9 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 已收集数据: ${data.collected_data || 0} 条<br>
                 订阅产品: ${data.subscribed || 0} 个<br>
                 客户端连接: ${data.clients || 0} 个<br>
-                24h成交量缓存: ${data.volume_cache || 0} 个
+                24h成交量缓存: ${data.volume_cache || 0} 个<br>
+                持仓量缓存: ${data.oi_cache || 0} 个<br>
+                历史持仓量缓存: ${data.oi_history_cache || 0} 个
             `;
         }
         
@@ -1871,35 +2480,137 @@ async def init_app():
 
 def run_okx_websocket():
     print("启动OKX WebSocket线程...")
+    
+    # 创建新的事件循环
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     
     try:
+        # 运行WebSocket处理器
         loop.run_until_complete(okx_websocket_handler())
     except Exception as e:
         print(f"OKX WebSocket线程错误: {e}")
         traceback.print_exc()
     finally:
-        loop.close()
+        # 清理事件循环
+        print("清理事件循环...")
+        try:
+            # 取消所有待处理的任务
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            
+            # 运行直到所有任务完成
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            
+            # 关闭事件循环
+            loop.close()
+            print("事件循环已关闭")
+        except Exception as e:
+            print(f"清理事件循环时出错: {e}")
 
 def signal_handler(signum, frame):
     global running
     print(f"\n接收到信号 {signum}, 正在停止程序...")
     running = False
+    
+    # 添加：同步关闭所有连接
+    try:
+        print("正在关闭所有WebSocket连接...")
+        
+        # 创建临时事件循环来关闭连接
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        # 关闭K线连接
+        if hasattr(connection_manager_kline, 'ws') and connection_manager_kline.ws:
+            loop.run_until_complete(connection_manager_kline.disconnect())
+        
+        # 关闭持仓量连接
+        if hasattr(connection_manager_oi, 'ws') and connection_manager_oi.ws:
+            loop.run_until_complete(connection_manager_oi.disconnect())
+        
+        loop.close()
+        print("所有连接已关闭")
+    except Exception as e:
+        print(f"关闭连接时出错: {e}")
+
+def check_existing_connections():
+    """检查是否已经有相同的程序在运行"""
+    import psutil
+    
+    current_pid = os.getpid()
+    current_process = psutil.Process(current_pid)
+    current_cmd = ' '.join(current_process.cmdline())
+    
+    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+        try:
+            if proc.pid != current_pid:
+                cmdline = proc.cmdline()
+                if cmdline and len(cmdline) > 1:
+                    # 检查是否有相同的Python脚本在运行
+                    if 'main.py' in cmdline[1] and 'python' in proc.name().lower():
+                        print(f"警告: 检测到相同的程序已经在运行 (PID: {proc.pid})")
+                        print("建议先停止之前的实例再运行新实例")
+                        return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    
+    return False
 
 def main():
     global running
     
+    # 检查是否有相同的程序在运行
+    if check_existing_connections():
+        answer = input("检测到可能有相同的程序在运行，是否继续? (y/n): ")
+        if answer.lower() != 'y':
+            print("程序退出")
+            sys.exit(0)
+    
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+    
+    # 添加：在启动时检查并清理可能的残留连接
+    print("清理可能的残留连接...")
+    try:
+        # 尝试关闭所有可能的连接
+        if hasattr(connection_manager_kline, 'ws') and connection_manager_kline.ws:
+            print("关闭K线残留连接...")
+            asyncio.run(connection_manager_kline.disconnect())
+        
+        if hasattr(connection_manager_oi, 'ws') and connection_manager_oi.ws:
+            print("关闭持仓量残留连接...")
+            asyncio.run(connection_manager_oi.disconnect())
+        
+        # 清空订阅列表
+        connection_manager_kline.subscription_args = []
+        connection_manager_oi.subscription_args = []
+        
+        # 重置连接状态
+        connection_manager_kline.connected = False
+        connection_manager_oi.connected = False
+        
+        print("残留连接清理完成")
+    except Exception as e:
+        print(f"清理残留连接时出错: {e}")
     
     print("OKX SWAP 实时监控系统启动中...")
     print(f"内存优化配置: 最大产品数={MAX_PRODUCTS}")
     print(f"重连配置: 延迟={RECONNECT_DELAY}秒, 最大尝试={MAX_RECONNECT_ATTEMPTS}")
     print(f"API频率控制: 请求间隔={API_RATE_LIMIT_DELAY}秒 (每0.3秒更新一个产品)")
     print("注意: 24h成交量数据采用连续更新模式，每0.3秒更新一个产品")
-    print("优化: 修复了排序逻辑和页面卡顿问题，提升了页面性能")
-    print("修复: 增加了API请求的重试机制和连接错误处理")
+    print("新增: 持仓量监控功能已添加")
+    print("      - 实时持仓量通过WebSocket获取 (wss://ws.okx.com:8443/ws/v5/public)")
+    print("      - 历史持仓量每小时更新一次")
+    print("      - 持仓量变化率显示在页面上")
+    print("      - 两个独立的WebSocket连接: K线和持仓量")
+    print("新增功能:")
+    print("      - 心跳保活机制，防止连接超时")
+    print("      - 连接重启功能")
+    print("      - 程序启动时自动清理残留连接")
     
     ws_thread = threading.Thread(target=run_okx_websocket, daemon=True)
     ws_thread.start()
