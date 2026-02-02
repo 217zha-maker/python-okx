@@ -50,7 +50,7 @@ reconnect_attempts = 0  # 当前重连尝试次数
 oi_reconnect_attempts = 0  # 持仓量重连尝试次数
 
 # API请求频率控制 - 优化为0.3秒一次，避免连接被终止
-API_RATE_LIMIT_DELAY = 0.2  # API请求间隔（秒），0.3秒=约3.3次/秒
+API_RATE_LIMIT_DELAY = 0.3  # API请求间隔（秒），0.3秒=约3.3次/秒
 API_BATCH_SIZE = 1  # 每次只更新一个产品，实现连续更新
 
 # 高效数据结构
@@ -79,7 +79,7 @@ class ConnectionManager:
         self.url = url  # WebSocket URL
         self.heartbeat_task = None  # 添加心跳任务
         self.last_ping_time = 0
-        self.ping_interval = 300  # 每20秒检查一次连接
+        self.ping_interval = 20  # 每20秒检查一次连接
         self.ping_timeout = 10   # 等待pong超时时间
         
     def _get_session(self):
@@ -181,7 +181,7 @@ class ConnectionManager:
                     self.last_ping_time = current_time
                     print(f"心跳检查: {self.url}，连接正常")
                 
-                await asyncio.sleep(5)  # 每5秒检查一次
+                await asyncio.sleep(300)  # 每300秒检查一次
                 
             except asyncio.CancelledError:
                 print(f"心跳循环被取消: {self.url}")
@@ -418,16 +418,11 @@ async def update_oi_history(inst_id, retry_count=0):
         if elapsed < API_RATE_LIMIT_DELAY:
             await asyncio.sleep(API_RATE_LIMIT_DELAY - elapsed)
         
-        # 计算1小时前的时间戳
-        current_timestamp = int(time.time() * 1000)  # 毫秒时间戳
-        one_hour_ago = current_timestamp - 3600 * 1000
-        
         # 获取历史持仓量数据
         trading_api = connection_manager_kline.get_trading_data_api()
         result = trading_api.get_open_interest_history(
             instId=inst_id,
             period="1H",
-            begin=str(one_hour_ago),
             limit="1"
         )
         
@@ -447,7 +442,23 @@ async def update_oi_history(inst_id, retry_count=0):
                         'period': '1H'
                     }
                     print(f"更新 {inst_id} 历史持仓量数据: {oi_ccy}")
+                    
+                    # 如果有实时持仓量数据，立即计算并更新变化率
+                    if inst_id in oi_data:
+                        current_oi = oi_data[inst_id].get('oi_ccy', 0)
+                        if current_oi > 0 and float(oi_ccy) > 0:
+                            oi_change_rate = calculate_oi_change_rate(current_oi, float(oi_ccy))
+                            
+                            # 更新数据存储
+                            price_store.update(inst_id, {
+                                'oi_history_ccy': float(oi_ccy),
+                                'oi_change_rate': oi_change_rate
+                            })
+                    
                     return True
+                else:
+                    print(f"历史持仓量数据格式错误: {latest_history}")
+                    return False
         else:
             error_code = result.get("code") if result else "unknown"
             error_msg = result.get("msg") if result else "No response"
@@ -475,7 +486,7 @@ async def update_oi_history(inst_id, retry_count=0):
         return False
 
 async def batch_update_oi_history():
-    """批量更新所有产品的历史持仓量数据"""
+    """批量更新所有产品的历史持仓量数据 - 整点更新专用"""
     global inst_ids
     
     if not inst_ids:
@@ -488,15 +499,9 @@ async def batch_update_oi_history():
     fail_count = 0
     
     for inst_id in inst_ids:
-        # 检查是否需要更新（每小时更新一次）
-        if inst_id in oi_last_update:
-            if time.time() - oi_last_update[inst_id] < 3600:  # 1小时内已更新
-                continue
-            
         result = await update_oi_history(inst_id)
         if result:
             success_count += 1
-            oi_last_update[inst_id] = time.time()
         else:
             fail_count += 1
         
@@ -879,8 +884,8 @@ async def okx_kline_handler():
                 print("OKX K线WebSocket连接成功")
                 
                 last_data_time = time.time()
-                last_oi_history_update = time.time()
-                last_oi_check_time = time.time()
+                last_oi_update_hour = -1  # 记录上次更新历史持仓量的小时
+                last_oi_update_time = 0  # 记录上次更新历史持仓量的时间
                 
                 while running and connection_manager_kline.is_connected():
                     await asyncio.sleep(1)
@@ -896,18 +901,24 @@ async def okx_kline_handler():
                         print("长时间没有收到K线数据，可能连接已断开")
                         break
                     
-                    # 每小时更新一次历史持仓量数据
-                    if current_time - last_oi_check_time >= 60:  # 每60秒检查一次
-                        current_minute = datetime.now().minute
-                        # 如果是整点后的1-2分钟，并且距离上次更新超过1小时，则更新
-                        if (current_minute in [1, 2]) and (current_time - last_oi_history_update >= 3600):
-                            print(f"整点后{current_minute}分钟，开始更新历史持仓量数据...")
+                    # 整点后30秒更新历史持仓量逻辑
+                    now = datetime.now()
+                    current_hour = now.hour
+                    current_minute = now.minute
+                    current_second = now.second
+                    
+                    # 在整点后的第30秒开始更新历史持仓量
+                    if current_minute == 0 and current_second == 30 and current_hour != last_oi_update_hour:
+                        print(f"整点{current_hour}:00:30，开始更新历史持仓量数据...")
+                        last_oi_update_hour = current_hour
+                        last_oi_update_time = current_time
+                        
+                        # 触发历史持仓量更新
+                        if main_event_loop and main_event_loop.is_running():
                             asyncio.run_coroutine_threadsafe(
                                 batch_update_oi_history(),
                                 main_event_loop
                             )
-                            last_oi_history_update = current_time
-                        last_oi_check_time = current_time
                     
                     if price_store.count() > 0:
                         last_data_time = current_time
@@ -2604,13 +2615,14 @@ def main():
     print("注意: 24h成交量数据采用连续更新模式，每0.3秒更新一个产品")
     print("新增: 持仓量监控功能已添加")
     print("      - 实时持仓量通过WebSocket获取 (wss://ws.okx.com:8443/ws/v5/public)")
-    print("      - 历史持仓量每小时更新一次")
+    print("      - 历史持仓量在整点后30秒更新一次")
     print("      - 持仓量变化率显示在页面上")
     print("      - 两个独立的WebSocket连接: K线和持仓量")
     print("新增功能:")
     print("      - 心跳保活机制，防止连接超时")
     print("      - 连接重启功能")
     print("      - 程序启动时自动清理残留连接")
+    print("      - 历史持仓量更新时间: 整点后30秒")
     
     ws_thread = threading.Thread(target=run_okx_websocket, daemon=True)
     ws_thread.start()
