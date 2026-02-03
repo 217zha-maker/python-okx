@@ -8,6 +8,7 @@ import sys
 from datetime import datetime, timedelta
 import okx.MarketData as MarketData
 import okx.TradingData as TradingData_api
+import okx.Account as Account  # 新增Account模块导入
 from okx.websocket.WsPublicAsync import WsPublicAsync
 from aiohttp import web
 import aiohttp_cors
@@ -37,6 +38,11 @@ volume_last_update = {}  # 记录每个产品24h成交量的最后更新时间
 oi_data = {}  # 存储实时持仓量数据
 oi_history_data = {}  # 存储历史持仓量数据
 oi_last_update = {}  # 记录每个产品持仓量的最后更新时间
+
+# API密钥配置
+API_KEY = "fc644348-d5e8-4ae1-8634-1aa3562011bb"
+SECRET_KEY = "50FA45723B520A43571064FAD1F6598C"
+PASSPHRASE = "12345678Zha."
 
 # 内存优化配置
 MAX_PRODUCTS = 300  # 限制监控的最大产品数量
@@ -72,6 +78,7 @@ class ConnectionManager:
         self.subscription_args = []
         self.market_api = None  # 不在这里初始化，使用时再创建
         self.trading_data_api = None  # 添加TradingDataAPI
+        self.account_api = None  # 添加AccountAPI
         self.last_api_call = 0  # 上次API调用时间
         self.api_request_count = 0  # API请求计数器
         self.api_request_reset_time = time.time()  # 重置计数器的时间
@@ -223,6 +230,12 @@ class ConnectionManager:
         if self.trading_data_api is None:
             self.trading_data_api = TradingData_api.TradingDataAPI(flag=flag, debug=False)
         return self.trading_data_api
+    
+    def get_account_api(self):
+        """获取AccountAPI实例（延迟创建）"""
+        if self.account_api is None:
+            self.account_api = Account.AccountAPI(API_KEY, SECRET_KEY, PASSPHRASE, False, flag)
+        return self.account_api
     
     def get_ticker_data_with_rate_limit(self, inst_id):
         """带速率限制的获取ticker数据"""
@@ -809,11 +822,13 @@ async def okx_kline_handler():
             # 等待一小段时间
             await asyncio.sleep(1)
             
-            marketDataAPI = MarketData.MarketAPI(flag=flag, debug=False)
-            result = marketDataAPI.get_tickers(instType="SWAP")
+            # 使用AccountAPI获取产品列表（修改这里）
+            accountAPI = connection_manager_kline.get_account_api()
+            result = accountAPI.get_instruments(instType="SWAP")
             
             if result and result.get("code") == "0":
-                all_products = [item["instId"] for item in result["data"]]
+                # 只获取状态为live的产品
+                all_products = [item["instId"] for item in result["data"] if item.get("state") == "live"]
                 inst_ids = []
                 for pair in main_pairs:
                     if pair in all_products:
@@ -2623,6 +2638,7 @@ def main():
     print("      - 连接重启功能")
     print("      - 程序启动时自动清理残留连接")
     print("      - 历史持仓量更新时间: 整点后30秒")
+    print("使用账户API获取产品列表")
     
     ws_thread = threading.Thread(target=run_okx_websocket, daemon=True)
     ws_thread.start()
