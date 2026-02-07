@@ -8,7 +8,7 @@ import sys
 from datetime import datetime, timedelta
 import okx.MarketData as MarketData
 import okx.TradingData as TradingData_api
-import okx.Account as Account
+import okx.Account as Account  # 新增Account模块导入
 from okx.websocket.WsPublicAsync import WsPublicAsync
 from aiohttp import web
 import aiohttp_cors
@@ -21,7 +21,6 @@ from collections import deque
 import requests
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
-import weakref
 
 # 全局变量
 flag = "0"
@@ -49,7 +48,6 @@ PASSPHRASE = "12345678Zha."
 MAX_PRODUCTS = 300  # 限制监控的最大产品数量
 MEMORY_CHECK_INTERVAL = 60  # 内存检查间隔（秒）
 DATA_CLEANUP_INTERVAL = 300  # 数据清理间隔（秒）
-MAX_DATA_AGE = 3600  # 数据最大保留时间（秒）- 1小时
 
 # 重连配置
 RECONNECT_DELAY = 5  # 重连延迟（秒）
@@ -90,7 +88,6 @@ class ConnectionManager:
         self.last_ping_time = 0
         self.ping_interval = 20  # 每20秒检查一次连接
         self.ping_timeout = 10   # 等待pong超时时间
-        self.callback_refs = []  # 存储回调函数的弱引用，避免内存泄漏
         
     def _get_session(self):
         """创建并配置requests session"""
@@ -134,9 +131,6 @@ class ConnectionManager:
     async def disconnect(self):
         """断开WebSocket连接"""
         try:
-            # 清理回调引用
-            self.callback_refs.clear()
-            
             # 停止心跳任务
             if self.heartbeat_task:
                 self.heartbeat_task.cancel()
@@ -192,6 +186,7 @@ class ConnectionManager:
                     
                     # 更新ping时间
                     self.last_ping_time = current_time
+                    print(f"心跳检查: {self.url}，连接正常")
                 
                 await asyncio.sleep(300)  # 每300秒检查一次
                 
@@ -212,8 +207,6 @@ class ConnectionManager:
                 return False
             
             self.subscription_args = args
-            # 使用弱引用存储回调，避免内存泄漏
-            self.callback_refs.append(weakref.ref(callback))
             await self.ws.subscribe(args, callback=callback)
             print(f"订阅成功，共 {len(args)} 个产品, URL: {self.url}")
             return True
@@ -394,36 +387,6 @@ def calculate_oi_change_rate(current_oi, history_oi):
     except (ValueError, TypeError):
         return 0
 
-def cleanup_old_data():
-    """清理过期数据，减少内存占用"""
-    global volume_24h_data, volume_last_update, oi_data, oi_history_data, oi_last_update, last_received_time
-    
-    current_time = time.time()
-    cutoff_time = current_time - MAX_DATA_AGE
-    
-    # 清理volume数据
-    expired_volumes = [k for k, v in volume_last_update.items() if v < cutoff_time]
-    for key in expired_volumes:
-        volume_24h_data.pop(key, None)
-        volume_last_update.pop(key, None)
-    
-    # 清理oi数据
-    expired_oi = [k for k, v in oi_last_update.items() if v < cutoff_time]
-    for key in expired_oi:
-        oi_data.pop(key, None)
-        oi_history_data.pop(key, None)
-        oi_last_update.pop(key, None)
-    
-    # 清理last_received_time
-    expired_received = [k for k, v in last_received_time.items() if v < cutoff_time]
-    for key in expired_received:
-        last_received_time.pop(key, None)
-    
-    print(f"数据清理完成: 删除{len(expired_volumes)}个过期成交量, {len(expired_oi)}个过期持仓量")
-    
-    # 强制垃圾回收
-    gc.collect()
-
 async def update_single_volume(inst_id, retry_count=0):
     """更新单个产品的24h成交量数据"""
     try:
@@ -491,6 +454,7 @@ async def update_oi_history(inst_id, retry_count=0):
                         'timestamp': time.time(),
                         'period': '1H'
                     }
+                    print(f"更新 {inst_id} 历史持仓量数据: {oi_ccy}")
                     
                     # 如果有实时持仓量数据，立即计算并更新变化率
                     if inst_id in oi_data:
@@ -674,36 +638,10 @@ class MemoryOptimizedDataStore:
         self.data = {}
         self.max_items = max_items
         self.lock = threading.Lock()
-        self.last_cleanup_time = time.time()
-        self.cleanup_interval = DATA_CLEANUP_INTERVAL  # 清理间隔
-    
-    def cleanup_old_entries(self):
-        """清理过期条目"""
-        with self.lock:
-            current_time = time.time()
-            expired_keys = []
-            
-            for key, value in self.data.items():
-                last_update = value.get('last_update', 0)
-                if current_time - last_update > MAX_DATA_AGE:
-                    expired_keys.append(key)
-            
-            for key in expired_keys:
-                del self.data[key]
-            
-            if expired_keys:
-                print(f"清理了 {len(expired_keys)} 个过期数据条目")
-            
-            self.last_cleanup_time = current_time
-            return len(expired_keys)
     
     def update(self, key, value):
         """更新数据，如果超过最大限制，删除最旧的数据"""
         with self.lock:
-            # 定期清理过期数据
-            if time.time() - self.last_cleanup_time > self.cleanup_interval:
-                self.cleanup_old_entries()
-            
             # 获取24h成交量数据（如果存在）
             volume_24h_info = volume_24h_data.get(key, {})
             
@@ -732,7 +670,6 @@ class MemoryOptimizedDataStore:
             
             if len(self.data) >= self.max_items and key not in self.data:
                 if self.data:
-                    # 找到最旧的条目
                     oldest_key = min(self.data.keys(), 
                                    key=lambda k: self.data[k].get('last_update', 0))
                     del self.data[oldest_key]
@@ -964,7 +901,6 @@ async def okx_kline_handler():
                 last_data_time = time.time()
                 last_oi_update_hour = -1  # 记录上次更新历史持仓量的小时
                 last_oi_update_time = 0  # 记录上次更新历史持仓量的时间
-                last_cleanup_time = time.time()
                 
                 while running and connection_manager_kline.is_connected():
                     await asyncio.sleep(1)
@@ -979,11 +915,6 @@ async def okx_kline_handler():
                     if current_time - last_data_time > 90:
                         print("长时间没有收到K线数据，可能连接已断开")
                         break
-                    
-                    # 定期清理过期数据
-                    if current_time - last_cleanup_time > DATA_CLEANUP_INTERVAL:
-                        cleanup_old_data()
-                        last_cleanup_time = current_time
                     
                     # 整点后30秒更新历史持仓量逻辑
                     now = datetime.now()
@@ -1071,7 +1002,6 @@ async def okx_oi_handler():
                                     'oi_ccy': oi_ccy,
                                     'timestamp': time.time()
                                 }
-                                oi_last_update[inst_id] = time.time()
                                 
                                 # 如果有历史数据，计算变化率
                                 if inst_id in oi_history_data:
@@ -1137,130 +1067,13 @@ async def okx_oi_handler():
         else:
             return False
     
-async def okx_oi_handler():
-    global ws_oi_connection_active, oi_reconnect_attempts
-    
-    print("OKX 持仓量WebSocket处理器启动...")
-    
-    def oi_callback(message):
-        try:
-            # 更新心跳时间
-            connection_manager_oi.last_heartbeat = time.time()
-            
-            if isinstance(message, str):
-                data = json.loads(message)
-            else:
-                data = message
-            
-            if "event" in data and data["event"] == "subscribe":
-                return
-            
-            if "data" in data and "arg" in data:
-                arg_data = data["arg"]
-                if "channel" in arg_data and arg_data["channel"] == "open-interest":
-                    oi_data_list = data["data"]
-                    
-                    if oi_data_list and len(oi_data_list) > 0:
-                        for item in oi_data_list:
-                            inst_id = item.get("instId")
-                            if inst_id and inst_id in inst_ids:  # 只处理我们监控的产品
-                                # 更新实时持仓量数据
-                                oi_ccy = float(item.get("oiCcy", 0))
-                                oi_data[inst_id] = {
-                                    'oi_ccy': oi_ccy,
-                                    'timestamp': time.time()
-                                }
-                                oi_last_update[inst_id] = time.time()
-                                
-                                # 如果有历史数据，计算变化率
-                                if inst_id in oi_history_data:
-                                    history_oi = oi_history_data[inst_id].get('oi_ccy', 0)
-                                    if history_oi > 0:
-                                        oi_change_rate = calculate_oi_change_rate(oi_ccy, history_oi)
-                                        
-                                        # 更新数据存储
-                                        price_store.update(inst_id, {
-                                            'oi_ccy': oi_ccy,
-                                            'oi_change_rate': oi_change_rate
-                                        })
-                                        
-                                        # 触发广播更新
-                                        try:
-                                            if main_event_loop and main_event_loop.is_running():
-                                                if broadcast_queue.qsize() < 50:
-                                                    asyncio.run_coroutine_threadsafe(
-                                                        broadcast_queue.put({
-                                                            'type': 'data_update',
-                                                            'inst_id': inst_id
-                                                        }),
-                                                        main_event_loop
-                                                    )
-                                        except:
-                                            pass
-        
-        except Exception as e:
-            print(f"处理持仓量消息时出错: {e}")
-    
-    async def connect_and_subscribe_oi():
-        global ws_oi_connection_active, oi_reconnect_attempts
-        
-        if not inst_ids:
-            print("等待产品列表获取...")
-            # 等待K线处理器获取产品列表
-            max_wait_time = 30  # 最大等待30秒
-            wait_start = time.time()
-            while not inst_ids and time.time() - wait_start < max_wait_time and running:
-                await asyncio.sleep(1)
-            
-            if not inst_ids:
-                print("等待产品列表超时，无法订阅持仓量数据")
-                return False
-        
-        print(f"开始订阅 {len(inst_ids)} 个产品的持仓量数据...")
-        
-        if await connection_manager_oi.connect():
-            ws_oi_connection_active = True
-            
-            # 分批订阅持仓量数据
-            oi_batch_size = 10
-            success_count = 0
-            for i in range(0, len(inst_ids), oi_batch_size):
-                batch = inst_ids[i:i+oi_batch_size]
-                args = [{"channel": "open-interest", "instId": inst_id} for inst_id in batch]
-                
-                if await connection_manager_oi.subscribe(args, oi_callback):
-                    success_count += 1
-                    await asyncio.sleep(0.5)
-                else:
-                    print(f"持仓量批次 {i//oi_batch_size + 1} 订阅失败")
-                    # 如果订阅失败，继续尝试下一个批次
-            
-            if success_count > 0:
-                print(f"持仓量订阅完成，成功订阅 {success_count} 个批次")
-                
-                if main_event_loop and main_event_loop.is_running():
-                    asyncio.run_coroutine_threadsafe(broadcast_connection_status(), main_event_loop)
-                
-                oi_reconnect_attempts = 0
-                return True
-            else:
-                print("所有持仓量批次订阅均失败")
-                await connection_manager_oi.disconnect()
-                return False
-        else:
-            print("连接持仓量WebSocket失败")
-            return False
-    
     while running:
         try:
             print("正在建立OKX 持仓量WebSocket连接...")
-            success = await connect_and_subscribe_oi()
-            
-            if success:
+            if await connect_and_subscribe_oi():
                 print("OKX 持仓量WebSocket连接成功")
                 
                 last_oi_data_time = time.time()
-                last_cleanup_time = time.time()
                 
                 while running and connection_manager_oi.is_connected():
                     await asyncio.sleep(1)
@@ -1276,11 +1089,6 @@ async def okx_oi_handler():
                         print("长时间没有收到持仓量数据，可能连接已断开")
                         break
                     
-                    # 定期清理过期数据
-                    if current_time - last_cleanup_time > DATA_CLEANUP_INTERVAL:
-                        cleanup_old_data()
-                        last_cleanup_time = current_time
-                    
                     # 更新最后数据时间
                     if oi_data:
                         last_oi_data_time = current_time
@@ -1290,9 +1098,8 @@ async def okx_oi_handler():
                 
                 if main_event_loop and main_event_loop.is_running():
                     asyncio.run_coroutine_threadsafe(broadcast_connection_status(), main_event_loop)
-            else:
-                # 连接失败，直接进入重连逻辑，不需要断开
-                print("OKX 持仓量WebSocket连接失败")
+            
+            await connection_manager_oi.disconnect()
             
             if running:
                 oi_reconnect_attempts += 1
@@ -1532,7 +1339,6 @@ async def broadcast_worker():
     connection_status_interval = 5
     last_volume_stats_time = 0
     volume_stats_interval = 10
-    last_cleanup_time = time.time()
     
     while running:
         try:
@@ -1541,11 +1347,6 @@ async def broadcast_worker():
             if not clients:
                 await asyncio.sleep(1)
                 continue
-            
-            # 定期清理过期数据
-            if current_time - last_cleanup_time > DATA_CLEANUP_INTERVAL:
-                cleanup_old_data()
-                last_cleanup_time = current_time
             
             if current_time - last_connection_status_time >= connection_status_interval:
                 await broadcast_connection_status()
@@ -1725,12 +1526,10 @@ async def websocket_handler(request):
     
     finally:
         clients.discard(ws)
-        # 强制垃圾回收
-        gc.collect()
     
     return ws
 
-# HTML模板（保持不变）
+# HTML模板（已修复排序和优化性能）
 HTML_TEMPLATE = '''<!DOCTYPE html>
 <html>
 <head>
@@ -2662,8 +2461,6 @@ async def start_background_tasks(app):
             memory_stats = get_memory_stats()
             if memory_stats['memory_usage'] > 200:
                 print(f"内存使用警告: {memory_stats['memory_usage']:.1f} MB")
-                # 清理过期数据
-                cleanup_old_data()
                 gc.collect()
     
     app['memory_check'] = asyncio.create_task(memory_check())
@@ -2842,7 +2639,6 @@ def main():
     print("      - 程序启动时自动清理残留连接")
     print("      - 历史持仓量更新时间: 整点后30秒")
     print("使用账户API获取产品列表")
-    print("内存优化: 数据过期清理机制 (最大保留1小时)")
     
     ws_thread = threading.Thread(target=run_okx_websocket, daemon=True)
     ws_thread.start()
